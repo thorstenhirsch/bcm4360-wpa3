@@ -224,6 +224,22 @@ int wl_re_mgmt_tx(struct net_device *dev, const unsigned char *f, int flen, void
 extern void re_auth_advance(void *bsscfg, int code, const unsigned char *mac, int p4, int p5);
 extern void *wlc_scbfind(void *wlc, void *bsscfg, const unsigned char *mac);
 
+/* The blob owns the host-IE buffer at assoc+0x30: it MFREE()s it (kfree) when the bsscfg is torn
+ * down, and uses it for every later assoc-req. We point it at static memory (wl_sae.assoc_ie), so
+ * it must be taken back before that: otherwise rmmod kfree()s module data ("Not a kmalloc
+ * allocation" + "Memory leak of bytes -50"), and a following non-SAE (WPA2) connect would still
+ * send the stale SAE RSN IE. Called on every connect, on disconnect and before wlc_detach(). */
+static void *re_assoc_ctx;
+void wl_re_release_assoc_ie(void)
+{
+	void *assoc = re_assoc_ctx;
+	if (!assoc)
+		return;
+	*(const unsigned char **)((char *)assoc + 0x30) = NULL;
+	*(unsigned int *)((char *)assoc + 0x38) = 0;
+	re_assoc_ctx = NULL;
+}
+
 void wl_re_drive_assoc(struct net_device *dev, void *bsscfg, const unsigned char *mac,
                        const unsigned char *assoc_ie, unsigned int assoc_ie_len)
 {
@@ -252,6 +268,7 @@ void wl_re_drive_assoc(struct net_device *dev, void *bsscfg, const unsigned char
 	 * its PSK/no-MFP template). This was NULL by default -> point it at wpa_s's IEs so the
 	 * assoc-req carries SAE AKM + MFPC + BIP, matching the AP and the userspace 4-way. */
 	if (assoc && assoc_ie && assoc_ie_len) {
+		re_assoc_ctx = assoc;
 		*(const unsigned char **)((char *)assoc + 0x30) = assoc_ie;
 		*(unsigned int *)((char *)assoc + 0x38) = assoc_ie_len;
 		re_log("re drive_assoc: injected host assoc IEs (%u bytes) at assoc+0x30\n",
@@ -1164,6 +1181,7 @@ wl_free(wl_info_t *wl)
 		wlc_module_unregister(wl->pub, "linux", wl);
 	}
 
+	wl_re_release_assoc_ie();   /* before the blob frees the bsscfg (see above) */
 	if (wl->wlc) {
 		{
 		char tmp1[128];
