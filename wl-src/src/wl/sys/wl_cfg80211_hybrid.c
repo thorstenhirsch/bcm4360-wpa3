@@ -1190,7 +1190,7 @@ static void wl_sae_ext_auth_work(struct work_struct *w)
 	memcpy(ext.bssid, wl_sae.bssid, ETH_ALEN);
 	ext.ssid = wl_sae.ssid;
 	rc = cfg80211_external_auth_request(wl_sae.dev, &ext, GFP_KERNEL);
-	WL_ERR(("re: deferred external SAE auth for %pM -> %d\n", wl_sae.bssid, rc));
+	re_log("re: deferred external SAE auth for %pM -> %d\n", wl_sae.bssid, rc);
 }
 
 static s32
@@ -1329,7 +1329,7 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 		wl_sae.ssid.ssid_len = min_t(size_t, sme->ssid_len, sizeof(wl_sae.ssid.ssid));
 		memcpy(wl_sae.ssid.ssid, sme->ssid, wl_sae.ssid.ssid_len);
 		wl_sae.armed = 1;       /* arm the SAE hooks for this exchange */
-		WL_ERR(("re: scheduling external SAE auth (bssid %pM)\n", wl_sae.bssid));
+		re_log("re: scheduling external SAE auth (bssid %pM)\n", wl_sae.bssid);
 		/* a bit more delay when we must learn the BSSID from the firmware's auth TX */
 		schedule_delayed_work(&wl_sae.work, msecs_to_jiffies(sme->bssid ? 150 : 250));
 	}
@@ -1547,8 +1547,8 @@ wl_cfg80211_add_key(struct wiphy *wiphy, struct net_device *dev,
 				memcpy(wl_sae.igtk_ipn, params->seq, 6);
 			wl_sae.pmf_active = true;   /* MFP is now active -> enforce SW PMF on RX */
 		}
-		WL_ERR(("re add_key: IGTK/BIP (idx=%u cipher=0x%x) stored SW; PMF active (no HW BIP)\n",
-		        (unsigned)key_idx, params->cipher));
+		re_log("re add_key: IGTK/BIP (idx=%u cipher=0x%x) stored SW; PMF active (no HW BIP)\n",
+		        (unsigned)key_idx, params->cipher);
 		return 0;
 	}
 	/* Capture the pairwise CCMP temporal key (PTK TK) for the SW SA-Query crypto. */
@@ -1556,7 +1556,7 @@ wl_cfg80211_add_key(struct wiphy *wiphy, struct net_device *dev,
 	    params->key && params->key_len == 16) {
 		memcpy(wl_sae.tk, params->key, 16);
 		wl_sae.tk_set = true;
-		WL_ERR(("re add_key: captured pairwise CCMP TK for SW mgmt crypto\n"));
+		re_log("re add_key: captured pairwise CCMP TK for SW mgmt crypto\n");
 	}
 
 	memset(&key, 0, sizeof(key));
@@ -2219,8 +2219,8 @@ wl_cfg80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
 		alg = f[24] | (f[25] << 8);
 
 	err = wl_re_mgmt_tx(dev, f, flen, wl_sae.scb);
-	WL_ERR(("re mgmt_tx: %d-byte frame auth_alg=%u da=%pM scb=%px -> %d\n",
-	        flen, alg, f + 4, wl_sae.scb, err));
+	re_log("re mgmt_tx: %d-byte frame auth_alg=%u da=%pM scb=%px -> %d\n",
+	        flen, alg, f + 4, wl_sae.scb, err);
 	if (cookie)
 		cfg80211_mgmt_tx_status(wdev, *cookie, f, flen, err == 0, GFP_KERNEL);
 	return err;
@@ -2236,8 +2236,8 @@ wl_cfg80211_external_auth(struct wiphy *wiphy, struct net_device *dev,
 	 * wpa_supplicant's RSN+RSNXE so the assoc-req matches the SAE+MFP AP. */
 	if (params->status == 0 && wl_sae.bsscfg) {
 		wl_sae.sae_ok = true;
-		WL_ERR(("re: SAE ok -> driving firmware to associate (assoc_ie_len=%u)\n",
-		        wl_sae.assoc_ie_len));
+		re_log("re: SAE ok -> driving firmware to associate (assoc_ie_len=%u)\n",
+		        wl_sae.assoc_ie_len);
 		wl_re_drive_assoc(dev, wl_sae.bsscfg, wl_sae.bssid,
 		                  wl_sae.assoc_ie, wl_sae.assoc_ie_len);
 		schedule_delayed_work(&wl_sae.assoc_wd, msecs_to_jiffies(WL_SAE_ASSOC_TIMEOUT_MS));
@@ -2299,7 +2299,7 @@ static __maybe_unused void wl_re_rx_auth(struct net_device *dev, const unsigned 
 	buf[22] = 0;   buf[23] = 0;              /* seq ctl */
 	memcpy(buf + 24, body, len);             /* auth body (alg/seq/status + SAE) */
 	cfg80211_rx_mgmt(wdev, wl_sae.freq ? wl_sae.freq : 2447, 0, buf, 24 + len, 0);
-	WL_ERR(("re rx_auth: delivered %u-byte SAE auth body up to userspace\n", len));
+	re_log("re rx_auth: delivered %u-byte SAE auth body up to userspace\n", len);
 	kfree(buf);
 }
 

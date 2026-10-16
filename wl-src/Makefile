@@ -135,6 +135,11 @@ ifeq ($(APIFINAL),WEXT)
   $(info Using Wireless Extension API)
 endif
 
+# Broadcom's code uses legacy trailing one-element arrays (maclist.ea[1], pmkid lists, ...)
+# indexed past [0]; CONFIG_UBSAN_BOUNDS kernels (Ubuntu) log a splat + taint (W) on every
+# connect/multicast change. Harmless here, so keep the sanitizer off for this module.
+UBSAN_SANITIZE     := n
+
 obj-m              += wl.o
 
 wl-objs            :=

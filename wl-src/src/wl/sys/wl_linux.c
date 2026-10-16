@@ -147,11 +147,11 @@ extern int wlc_queue_80211_frag(void *wlc, void *pkt, void *txq, void *scb,
 extern void *wlc_bsscfg_find_by_bssid(void *wlc, const void *bssid);
 extern void *wlc_scbfind(void *wlc, void *bsscfg, const unsigned char *mac);
 
-/* Verbose RE/WPA3 debug logging toggle (default on). Mute at runtime with:
- *   echo 0 | sudo tee /sys/module/wl/parameters/re_verbose      */
-int re_verbose = 1;
+/* Verbose WPA3/PMF debug logging toggle (default off). Enable at runtime with:
+ *   echo 1 | sudo tee /sys/module/wl/parameters/re_verbose      */
+int re_verbose = 0;
 module_param(re_verbose, int, 0644);
-MODULE_PARM_DESC(re_verbose, "verbose WPA3/PMF debug printk (1=on, 0=off)");
+MODULE_PARM_DESC(re_verbose, "verbose WPA3/PMF debug printk (1=on, 0=off, default off)");
 #define re_log(...) do { if (re_verbose) printk(KERN_ERR __VA_ARGS__); } while (0)
 
 void *wl_re_dev_wlc(struct net_device *dev, void **osh_out)
@@ -313,6 +313,7 @@ static void wl_report_radio_state(wl_info_t *wl);
 /* EXPERIMENTAL FORK ONLY: GPL so we can use the kernel crypto AEAD (ccm(aes)) for the SW
  * 802.11w SA-Query layer. The stable repo keeps "MIXED/Proprietary". Never distributed. */
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Broadcom 802.11 hybrid wl driver with WPA3-SAE and 802.11w (PMF) support");
 
 static struct pci_device_id wl_id_table[] =
 {
