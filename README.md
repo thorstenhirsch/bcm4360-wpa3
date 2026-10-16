@@ -66,8 +66,10 @@ auth→assoc advancer at `0x5b79d`), the RX dispatch (`wlc_recv`), and the PMK/k
 
 - **Kernel hard-locks during SAE, no backtrace.** A `--add-symbol` address was off by one hex
   digit (`0x15b79d` vs `0x5b79d`), landing mid-instruction → `call <garbage>` → NX fault.
-  *The tell is the build warning `objtool: ... can't find starting instruction`; verify every
-  synthetic symbol is a real function start.*
+  *Verify every synthetic symbol is a real function start (`objdump -d --start-address=...`).
+  (Older kernels flagged this at build time with `objtool: ... can't find starting instruction`;
+  since Linux 6.15 objtool cannot process the blob at all, so the Makefile skips it for the final
+  `wl.o` link and that safety net is gone.)*
 - **Can't capture the panic.** efi-pstore is broken on Apple EFI; netconsole can't TX over a
   USB-ethernet NIC. *Stream `dmesg --follow` over SSH to a second machine — it flushes the oops
   before the reboot.*
@@ -83,11 +85,18 @@ auth→assoc advancer at `0x5b79d`), the RX dispatch (`wlc_recv`), and the PMK/k
 ## Build
 
 Needs kernel headers, `gcc`, `binutils`, `python3`. The blob is **not** in this repo (proprietary).
+Builds against Linux 6.12 through 7.3 (see *Tested* below).
 
 ```sh
 # 1. Get the pristine blob from broadcom-sta 6.30.223.271:
 #    hybrid-v35_64-nodebug-pcoem-6_30_223_271.tar.gz  ->  lib/wlc_hybrid.o_amd64
 cp /path/to/wlc_hybrid.o_amd64 wl-src/lib/wlc_hybrid.o_amd64.orig
+#    Debian/Ubuntu: it is the same file the broadcom-sta-dkms package ships
+#    (sha256 352a6e349f74c69b78e76f68c63752c99b8f6b22dc942af531b754211d7f4743):
+#      sudo apt install broadcom-sta-dkms   # then, instead of the cp above:
+#      cp /usr/src/broadcom-sta-6.30.223.271/lib/wlc_hybrid.o_amd64 wl-src/lib/wlc_hybrid.o_amd64.orig
+#    (remove/blacklist that package's own `wl` afterwards, it conflicts with ours)
+mkdir -p wl-src/lib
 
 # 2. Build:
 ./build.sh                 # -> wl-src/wl.ko   (or download it from Releases)
@@ -98,16 +107,17 @@ cp /path/to/wlc_hybrid.o_amd64 wl-src/lib/wlc_hybrid.o_amd64.orig
 ### Quick test
 ```sh
 sudo rmmod b43 brcmfmac bcma ssb wl 2>/dev/null   # free the card
-sudo insmod wl-src/wl.ko                          # wlan0 appears
+sudo insmod wl-src/wl.ko                          # a wifi interface appears (wlan0, wlp3s0, ...)
 ```
 **NetworkManager drives WPA3-SAE through this driver** — just use the wifi GUI: pick your network,
 enter the password, done. NM saves it and auto-reconnects on every boot. CLI equivalent:
 ```sh
-nmcli con add type wifi ifname wlan0 con-name w ssid "YOUR_SSID"
+nmcli con add type wifi ifname YOUR_IFNAME con-name w ssid "YOUR_SSID"
 nmcli con modify w wifi-sec.key-mgmt sae wifi-sec.psk "YOUR_PASS" 802-11-wireless-security.pmf 3
 nmcli con up w        # NM does SAE + 4-way + DHCP
 ```
-(Standalone alternative: `sudo ./examples/connect.sh wlan0 examples/wpa3-sae.conf.example`.)
+(Standalone alternative: `sudo ./examples/connect.sh [ifname] examples/wpa3-sae.conf.example`;
+the interface name defaults to the first wireless interface.)
 
 ### Persistent (survives reboot + kernel updates)
 ```sh
@@ -119,20 +129,51 @@ the wifi GUI. Details and the one DKMS gotcha: [`dkms/README.md`](dkms/README.md
 manual rebuild instead, run `./build.sh` → `wl-src/wl.ko`.
 
 ### Debug logging
-The driver prints verbose WPA3/PMF debug by default. Silence it at runtime (or permanently):
+The driver is quiet by default. For a bug report, or to watch the WPA3/PMF state machine, enable
+verbose logging (BSSIDs and the RSN IE are logged, so scrub them before posting):
 ```sh
-echo 0 | sudo tee /sys/module/wl/parameters/re_verbose          # this boot
-echo 'options wl re_verbose=0' | sudo tee /etc/modprobe.d/wl-quiet.conf   # permanent
+echo 1 | sudo tee /sys/module/wl/parameters/re_verbose          # this boot
+echo 'options wl re_verbose=1' | sudo tee /etc/modprobe.d/wl-debug.conf   # permanent
 ```
+
+## WPA2/WPA3 transition-mode APs
+
+Use a **WPA3 (SAE)** profile on the client; a `wpa-psk` profile connects with WPA2 by design:
+```sh
+nmcli con modify YOUR_CON wifi-sec.key-mgmt sae 802-11-wireless-security.pmf 3
+```
+For SAE connections the driver then:
+- detects SAE from the auth type, every offered AKM and wpa_supplicant's RSN IE;
+- keeps the blob from roaming on its own, and **refuses any association the blob makes without a
+  successful host SAE** (the blob can only do Open/PSK, which a transition-mode AP would accept);
+- fails the connect right away when SAE fails, when the AP rejects the association, or when the
+  association has not completed 3 s after SAE (so wpa_supplicant retries immediately instead of
+  after its 10 s timeout);
+- sends a CCMP-protected deauth on disconnect (the blob's own deauth is unprotected and a PMF
+  AP ignores it).
+
+If the AP uses the same SSID on 2.4 and 5 GHz, wpa_supplicant picks the stronger BSS; pin one with
+`802-11-wireless.band a|bg` or `802-11-wireless.bssid` if you want.
+
+**Known issue:** re-joining a transition-mode AP *immediately* after disconnecting from it (e.g.
+`nmcli con down` followed at once by `nmcli con up`) can fail on the first try and succeed on the
+next, because the AP appears to still hold the old association. Typical connect time in that
+stress test is 1-7 s, with an occasional ~20 s case. It was not observed on the first connect
+after loading the module. (Suspend/resume has not been tested.)
+
+## Tested
+
+| Kernel | How | Result |
+|---|---|---|
+| 7.3.0-9 (Ubuntu 26.10) | loaded and used, Intel MacBookPro11,1, FRITZ!Box 6690 in WPA2/WPA3 mixed mode (2.4 + 5 GHz, same SSID) | all ~40 down/up reconnect cycles ended connected over SAE (some needed a retry, see known issue); WPA2-PSK and SAE profiles can be switched without reloading; clean `rmmod`/`insmod`; wrong password fails cleanly |
+| 6.12, 6.14, 6.17, 7.0, 7.1, 7.2 | build only, against the mainline-PPA header packages | builds |
+| 6.12 (Debian 13) | loaded and used, MacBookPro11,3, WPA3-only AP (previous release) | worked |
 
 ## Caveats
 
-- **Mixed WPA2/WPA3 (transition-mode) APs are unreliable** — the host-driven SAE doesn't always win
-  the negotiation. Use a single mode: set the AP to WPA3-only (or WPA2-only), or pin the security in
-  the NetworkManager connection (WPA3 Personal / SAE, or WPA2). A pure-WPA3 network connects every
-  time.
 - The blob (`wlc_hybrid.o_amd64`) is **Broadcom proprietary** — get it from broadcom-sta yourself.
   The `wl.ko` in Releases embeds it (same situation as Debian's `broadcom-sta-dkms`).
 - Offsets are specific to broadcom-sta **6.30.223.271 / BCM4360**.
-- Tested on Linux 6.12 (Debian 13), Intel MacBookPro11,3.
+- A prebuilt `wl.ko` is tied to the exact kernel it was built for (`vermagic`); build from source
+  (or use DKMS) for any other kernel.
 - Research code. License: GPL-2.0 (this wrapper) + Broadcom's license (the blob).
