@@ -1463,8 +1463,12 @@ wl_alloc_linux_if(wl_if_t *wlif)
 	bzero(dev, sizeof(struct net_device));
 	ether_setup(dev);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+	strscpy(dev->name, intf_name, IFNAMSIZ);
+#else
 	strncpy(dev->name, intf_name, IFNAMSIZ-1);
 	dev->name[IFNAMSIZ-1] = '\0';
+#endif
 
 	priv_link = MALLOC(wl->osh, sizeof(priv_link_t));
 	if (!priv_link) {
@@ -1637,7 +1641,9 @@ wl_down(wl_info_t *wl)
 		int i = 0;
 		for (i = 0; (atomic_read(&wl->callbacks) > callbacks) && i < 10000; i++) {
 			schedule();
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
 			flush_scheduled_work();
+#endif
 		}
 	}
 	else
@@ -1681,8 +1687,12 @@ wl_get_driver_info(struct net_device *dev, struct ethtool_drvinfo *info)
 #endif
 	bzero(info, sizeof(struct ethtool_drvinfo));
 	snprintf(info->driver, sizeof(info->driver), "wl%d", wl->pub->unit);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+	strscpy(info->version, EPI_VERSION_STR, sizeof(info->version));
+#else
 	strncpy(info->version, EPI_VERSION_STR, sizeof(info->version));
 	info->version[(sizeof(info->version))-1] = '\0';
+#endif
 }
 
 static int
@@ -2505,7 +2515,9 @@ wl_timer(
 #endif
 ) {
 	wl_timer_t *t =
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+		timer_container_of(t, tl, timer);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
 		from_timer(t, tl, timer);
 #else
 		(wl_timer_t *)data;
@@ -2611,7 +2623,11 @@ wl_del_timer(wl_info_t *wl, wl_timer_t *t)
 	ASSERT(t);
 	if (t->set) {
 		t->set = FALSE;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
+		if (!timer_delete(&t->timer)) {
+#else
 		if (!del_timer(&t->timer)) {
+#endif
 #ifdef BCMDBG
 			WL_INFORM(("wl%d: Failed to delete timer %s\n", wl->unit, t->name));
 #endif
@@ -3170,7 +3186,11 @@ _wl_add_monitor_if(wl_task_t *task)
 	}
 
 	ASSERT(strlen(wlif->name) > 0);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+	memcpy(wlif->dev->name, wlif->name, strlen(wlif->name));
+#else
 	strncpy(wlif->dev->name, wlif->name, strlen(wlif->name));
+#endif
 
 	wl->monitor_dev = dev;
 	if (wl->monitor_type == 1)
