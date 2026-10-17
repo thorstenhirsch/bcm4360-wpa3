@@ -858,7 +858,7 @@ wl_set_wpa_version(struct net_device *dev, struct cfg80211_connect_params *sme)
 
 	if (sme->crypto.wpa_versions & NL80211_WPA_VERSION_1)
 		val = WPA_AUTH_PSK | WPA_AUTH_UNSPECIFIED;
-	else if (sme->crypto.wpa_versions & NL80211_WPA_VERSION_2)
+	else if (sme->crypto.wpa_versions & (NL80211_WPA_VERSION_2 | BIT(2) /* NL80211_WPA_VERSION_3: SAE */))
 		val = WPA2_AUTH_PSK | WPA2_AUTH_UNSPECIFIED;
 	else
 		val = WPA_AUTH_DISABLED;
@@ -1213,9 +1213,24 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 	 * verbatim in the SAE assoc-req (see wl_re_drive_assoc). */
 	wl_sae.assoc_ie_len = 0;
 	wl_sae.pmf_active = false;   /* re-armed when the IGTK installs after the 4-way */
-	if (sme->ie && sme->ie_len && sme->ie_len <= sizeof(wl_sae.assoc_ie)) {
-		memcpy(wl_sae.assoc_ie, sme->ie, sme->ie_len);
-		wl_sae.assoc_ie_len = (u16)sme->ie_len;
+	if (sme->ie && sme->ie_len) {
+		/* Only the RSN (+RSNX) elements: the blob pastes this buffer into its assoc request next to its
+		 * own capability IEs, so wpa_supplicant's Extended Capabilities / Supported Operating Classes
+		 * would be sent twice and confuse the AP. */
+		const u8 *ie = sme->ie;
+		size_t left = sme->ie_len;
+
+		while (left >= 2 && (size_t)ie[1] + 2 <= left) {
+			size_t el = (size_t)ie[1] + 2;
+
+			if ((ie[0] == WLAN_EID_RSN || ie[0] == WLAN_EID_RSNX) &&
+			    wl_sae.assoc_ie_len + el <= sizeof(wl_sae.assoc_ie)) {
+				memcpy(wl_sae.assoc_ie + wl_sae.assoc_ie_len, ie, el);
+				wl_sae.assoc_ie_len += (u16)el;
+			}
+			ie += el;
+			left -= el;
+		}
 		if (re_verbose)
 			print_hex_dump(KERN_ERR, "re connIE: ", DUMP_PREFIX_OFFSET, 16, 1,
 			               sme->ie, sme->ie_len > 96 ? 96 : (int)sme->ie_len, false);
