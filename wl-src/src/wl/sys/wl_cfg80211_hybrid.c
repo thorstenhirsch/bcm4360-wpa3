@@ -254,6 +254,7 @@ static void wl_deinit_priv_mem(struct wl_cfg80211_priv *wl);
 static bool wl_is_ibssmode(struct wl_cfg80211_priv *wl);
 
 static void wl_link_up(struct wl_cfg80211_priv *wl);
+static struct cfg80211_bss *wl_get_ess_bss(struct wl_cfg80211_priv *wl);
 static void wl_link_down(struct wl_cfg80211_priv *wl);
 static s32 wl_set_mode(struct net_device *ndev, s32 iftype);
 
@@ -3179,6 +3180,23 @@ static void wl_ch_to_chanspec(struct ieee80211_channel *chan, struct wl_join_par
 	}
 }
 
+/* cfg80211's entry for the AP we are associated to (NULL if it has none). The BSS-type/privacy
+ * arguments changed in 4.1; the fallback lookup below used the pre-4.1 capability masks on every
+ * kernel, which means "PBSS, privacy on" today and never matches an ESS BSS. */
+static struct cfg80211_bss *wl_get_ess_bss(struct wl_cfg80211_priv *wl)
+{
+	struct wlc_ssid *ssid = &wl->profile->ssid;
+
+	return cfg80211_get_bss(wl_to_wiphy(wl), NULL, (s8 *)&wl->bssid,
+			       ssid->SSID, ssid->SSID_len,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0)
+			       WLAN_CAPABILITY_ESS, WLAN_CAPABILITY_ESS
+#else
+			       IEEE80211_BSS_TYPE_ESS, IEEE80211_PRIVACY_ANY
+#endif
+			       );
+}
+
 static s32 wl_update_bss_info(struct wl_cfg80211_priv *wl)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0)
@@ -3194,14 +3212,7 @@ static s32 wl_update_bss_info(struct wl_cfg80211_priv *wl)
 	s32 err = 0;
 
 	ssid = &wl->profile->ssid;
-	bss = cfg80211_get_bss(wl_to_wiphy(wl), NULL, (s8 *)&wl->bssid,
-			       ssid->SSID, ssid->SSID_len,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0)
-			       WLAN_CAPABILITY_ESS, WLAN_CAPABILITY_ESS
-#else
-			       IEEE80211_BSS_TYPE_ESS, IEEE80211_PRIVACY_ANY
-#endif
-			       );
+	bss = wl_get_ess_bss(wl);
 
 	rtnl_lock();
 	if (!bss) {
@@ -3222,8 +3233,7 @@ static s32 wl_update_bss_info(struct wl_cfg80211_priv *wl)
 		if (err)
 			goto update_bss_info_out;
 
-		bss = cfg80211_get_bss(wl_to_wiphy(wl), NULL, (s8 *)&wl->bssid,
-		      ssid->SSID, ssid->SSID_len, WLAN_CAPABILITY_ESS, WLAN_CAPABILITY_ESS);
+		bss = wl_get_ess_bss(wl);
 
 		ie = ((u8 *)bi) + bi->ie_offset;
 		ie_len = bi->ie_length;
@@ -3319,6 +3329,20 @@ wl_bss_roaming_done(struct wl_cfg80211_priv *wl, struct net_device *ndev,
 	return err;
 }
 
+/* Abort an association we refuse to report as success: tear it down in the firmware and tell cfg80211
+ * the connect failed so wpa_supplicant retries at once. */
+static void wl_refuse_assoc(struct net_device *ndev, const u8 *addr, const char *why)
+{
+	scb_val_t scbval;
+
+	re_log("re: refusing association: %s\n", why);
+	memset(&scbval, 0, sizeof(scbval));
+	memcpy(&scbval.ea, addr, ETHER_ADDR_LEN);
+	scbval.val = htod32(WLAN_REASON_UNSPECIFIED);
+	wl_dev_ioctl(ndev, WLC_DISASSOC, &scbval, sizeof(scbval));
+	cfg80211_connect_result(ndev, addr, NULL, 0, NULL, 0, WLAN_STATUS_UNSPECIFIED_FAILURE, GFP_KERNEL);
+}
+
 static s32
 wl_bss_connect_done(struct wl_cfg80211_priv *wl, struct net_device *ndev,
                     const wl_event_msg_t *e, void *data, bool completed)
@@ -3350,20 +3374,22 @@ wl_bss_connect_done(struct wl_cfg80211_priv *wl, struct net_device *ndev,
 			if (wl_sae.sae_conn &&
 			    (!wl_sae.sae_ok ||
 			     wl_rsn_ie_has_sae(conn_info->req_ie, conn_info->req_ie_len) == 0)) {
-				scb_val_t scbval;
-				re_log("re: association without SAE (sae_ok=%d) -> refusing\n",
-				        wl_sae.sae_ok);
-				memset(&scbval, 0, sizeof(scbval));
-				memcpy(&scbval.ea, &e->addr, ETHER_ADDR_LEN);
-				scbval.val = htod32(WLAN_REASON_UNSPECIFIED);
-				wl_dev_ioctl(ndev, WLC_DISASSOC, &scbval, sizeof(scbval));
-				cfg80211_connect_result(ndev, (u8 *)&e->addr, NULL, 0, NULL, 0,
-				                        WLAN_STATUS_UNSPECIFIED_FAILURE, GFP_KERNEL);
+				wl_refuse_assoc(ndev, (u8 *)&e->addr, "association without SAE");
 				return -ECONNREFUSED;
 			}
 			memcpy(&wl->bssid, &e->addr, ETHER_ADDR_LEN);
 			memcpy(wl->profile->bssid, &e->addr, ETHER_ADDR_LEN);
 			wl_update_bss_info(wl);
+			/* cfg80211 drops (with a WARN) a "connected" report for a BSS it has no entry for,
+			 * and then wpa_supplicant never learns that we are up. Fail the attempt instead. */
+			{
+				struct cfg80211_bss *b = wl_get_ess_bss(wl);
+				if (!b) {
+					wl_refuse_assoc(ndev, (u8 *)&e->addr, "cfg80211 has no BSS entry for the AP");
+					return -ECONNREFUSED;
+				}
+				cfg80211_put_bss(wl_to_wiphy(wl), b);
+			}
 			set_bit(WL_STATUS_CONNECTED, &wl->status);
 		}
 
