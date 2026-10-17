@@ -1148,6 +1148,7 @@ static struct {
 	u16  saq_tid;
 	int  saq_tries;
 	u64  rx_mgmt_pn;               /* last accepted PN of the AP's protected deauth/disassoc */
+	bool stub_seen;     /* the blob has sent its own stub auth frame for this join */
 	bool sae_conn;      /* current connect request is WPA3-SAE (set in .connect) */
 	bool sae_ok;        /* host SAE finished OK (.external_auth status 0) for this connection */
 	u32  freq;          /* MHz of the connect channel (0 = unknown) */
@@ -1166,6 +1167,14 @@ static void wl_re_saq_chk_work(struct work_struct *w);
  * of connects on a FRITZ!Box 6690), and wpa_supplicant then only notices after its own 10 s
  * timeout. Fail the connect ourselves after a short grace period so it retries right away.
  * A normal association completes within ~50 ms of re_auth_advance. */
+/* The blob sends a stub SAE auth frame of its own for every join (needed so it enters the
+ * authenticating state; the AP rejects it). The real exchange, driven by wpa_supplicant, MUST start
+ * after that stub: if our SAE commit goes out first, the late stub makes the AP discard its SAE
+ * state and the join collapses ~0.3 s later (SET_SSID FAIL). The stub's timing varies (100-340 ms
+ * after the join; later when the AP's scb already exists, i.e. when re-joining the same BSS), so a
+ * fixed delay cannot work: start when the stub has been sent, with a fallback if it never is. */
+#define WL_SAE_STUB_GRACE_MS		40
+#define WL_SAE_START_FALLBACK_MS	500
 #define WL_SAE_ASSOC_TIMEOUT_MS	3000
 static void wl_sae_assoc_wd_work(struct work_struct *w)
 {
@@ -1262,6 +1271,7 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 		wl_sae.inited = true;
 	}
 	wl_sae.dev = dev;
+	cancel_delayed_work_sync(&wl_sae.work);       /* a start scheduled by a previous attempt */
 	cancel_delayed_work_sync(&wl_sae.assoc_wd);   /* stale watchdog of a previous attempt */
 	cancel_delayed_work_sync(&wl_sae.saq_chk);
 	wl_sae.saq_pending = false;
@@ -1364,8 +1374,9 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 		memcpy(wl_sae.ssid.ssid, sme->ssid, wl_sae.ssid.ssid_len);
 		wl_sae.armed = 1;       /* arm the SAE hooks for this exchange */
 		re_log("re: scheduling external SAE auth (bssid %pM)\n", wl_sae.bssid);
-		/* a bit more delay when we must learn the BSSID from the firmware's auth TX */
-		schedule_delayed_work(&wl_sae.work, msecs_to_jiffies(sme->bssid ? 150 : 250));
+		wl_sae.stub_seen = false;
+		/* normally brought forward by __wrap_wlc_sendauth() as soon as the blob's stub is out */
+		schedule_delayed_work(&wl_sae.work, msecs_to_jiffies(WL_SAE_START_FALLBACK_MS));
 	}
 
 	return err;
@@ -2359,6 +2370,8 @@ long __wrap_wlc_sendauth(void *a1, void *a2, void *a3, void *a4, int alg,
 	/* Let the firmware's auth SEND proceed so it enters the authenticating state
 	 * (needed for the RX dispatch to route the AP's auth reply to us). The stub it
 	 * emits is harmless (AP rejects it); wpa_supplicant drives the real SAE in parallel. */
+	long ret;
+
 	if (alg == 3) {
 		wl_sae.bsscfg = a1;     /* capture bsscfg for the post-SAE assoc drive */
 		wl_sae.scb = a4;        /* capture AP scb (wlc_sendauth arg4) for host mgmt TX */
@@ -2370,7 +2383,13 @@ long __wrap_wlc_sendauth(void *a1, void *a2, void *a3, void *a4, int alg,
 		re_log("re: firmware auth alg=3 seq=%d bssid=%pM bsscfg=%px scb=%px (passthrough)\n",
 		       seq, wl_sae.bssid, a1, a4);
 	}
-	return wlc_sendauth(a1, a2, a3, a4, alg, seq, status, a8, a9, a10);
+	ret = wlc_sendauth(a1, a2, a3, a4, alg, seq, status, a8, a9, a10);
+	if (alg == 3 && wl_sae.armed && wl_sae.inited && !wl_sae.stub_seen) {
+		/* the stub is out: now (and only now) let wpa_supplicant start the real SAE exchange */
+		wl_sae.stub_seen = true;
+		mod_delayed_work(system_wq, &wl_sae.work, msecs_to_jiffies(WL_SAE_STUB_GRACE_MS));
+	}
+	return ret;
 }
 
 extern void wlc_authresp_client(void *bsscfg, long p2, unsigned short *body,
