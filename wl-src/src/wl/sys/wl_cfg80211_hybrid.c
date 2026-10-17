@@ -837,6 +837,42 @@ static int wl_rsn_ie_has_sae(const u8 *ie, size_t len)
 	return -1;
 }
 
+/* Does the RSN element in this IE blob demand protected management frames (RSN capabilities, MFPR)?
+ * wpa_supplicant sets MFPR only for "PMF required"; for "optional" it sets MFPC alone, but then
+ * still passes NL80211_MFP_REQUIRED to the kernel when the AP is PMF-capable, so cfg80211's mfp
+ * flag cannot tell the two apart. */
+static bool wl_rsn_ie_mfpr(const u8 *ie, size_t len)
+{
+	while (ie && len >= 2) {
+		size_t elen = ie[1];
+		if (elen + 2 > len)
+			break;
+		if (ie[0] == WLAN_EID_RSN) {
+			const u8 *p = ie + 2;
+			size_t rem = elen;
+			u16 n;
+			/* version(2) group(4) pairwise-count(2) pairwise(4*n) akm-count(2) akm(4*m) caps(2) */
+			if (rem < 8)
+				return false;
+			n = p[6] | (p[7] << 8);
+			if (rem < 8 + (size_t)n * 4 + 2)
+				return false;
+			p += 8 + n * 4;
+			rem -= 8 + n * 4;
+			n = p[0] | (p[1] << 8);
+			p += 2;
+			rem -= 2;
+			if (rem < (size_t)n * 4 + 2)
+				return false;
+			p += n * 4;
+			return (p[0] | (p[1] << 8)) & 0x0040;
+		}
+		ie += elen + 2;
+		len -= elen + 2;
+	}
+	return false;
+}
+
 /* Does this connect request ask for WPA3-SAE? Checked by auth_type, every offered AKM and the
  * RSN IE wpa_supplicant built -- not just akm_suites[0]. */
 static bool wl_sme_is_sae(struct cfg80211_connect_params *sme)
@@ -1340,6 +1376,19 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 
 	if (!sme->ssid) {
 		WL_ERR(("Invalid ssid\n"));
+		return -EOPNOTSUPP;
+	}
+
+	/* The blob can only do 802.11w together with SAE (we supply the RSN element and the PMF handling
+	 * for that). A WPA2-PSK join is built by the blob alone, with an RSN element that has no PMF bits,
+	 * so "PMF required" (MFPR in the RSN element) would silently connect without PMF. Fail closed
+	 * instead. "Optional" (MFPC only) is fine: it means "if possible". */
+	re_log("re: connect request: mfp=%d sae=%d rsn_mfpr=%d ie_len=%zu akms=%d wpa_versions=0x%x\n",
+	       sme->mfp, wl_sme_is_sae(sme), wl_rsn_ie_mfpr(sme->ie, sme->ie_len), sme->ie_len,
+	       sme->crypto.n_akm_suites, sme->crypto.wpa_versions);
+	if (!wl_sme_is_sae(sme) && wl_rsn_ie_mfpr(sme->ie, sme->ie_len)) {
+		pr_warn_ratelimited("wl: refusing the connection: protected management frames (802.11w) are required, "
+		                    "but only WPA3-SAE supports them with this driver; use WPA3 or set PMF to optional/disabled\n");
 		return -EOPNOTSUPP;
 	}
 

@@ -218,6 +218,9 @@ If the AP uses the same SSID on 2.4 and 5 GHz, wpa_supplicant picks the stronger
 - The blob knows nothing about 802.11w, so the driver handles the PMF parts of the Block-Ack setup in
   software (see below). If the module cannot get a synchronous `ccm(aes)` implementation, that is
   disabled and SAE/PMF sessions run without frame aggregation (slow). `re_pmf_ba=0` turns it off.
+- PMF only works with WPA3-SAE here: the blob builds the RSN element of a WPA2-PSK join itself, without PMF.
+  NetworkManager does not ask for PMF on WPA2-PSK profiles (its PMF setting is ignored there); a direct
+  wpa_supplicant config with `ieee80211w=2` and WPA-PSK is refused instead of connecting without PMF.
 - Not tested: a WPA3-only AP on this version, other APs than the FRITZ!Box 6690, 6.12-7.2 beyond building.
 
 ## Tested
