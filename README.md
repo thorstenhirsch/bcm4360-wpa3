@@ -146,6 +146,18 @@ software and hands them to the blob, and CCMP-protects the blob's own, so the ag
 normally (SAE 150-210 Mbit/s down, 0% retries on the same link). Module parameter `re_pmf_ba`:
 `2` (default) = full, `1` = decline the AP's ADDBA (no aggregation), `0` = off.
 
+### Stalled-link recovery (PMF / WPA3)
+In soak tests under load a PMF link occasionally went bad without any deauth: after a scan the blob's rate
+control ran away to its top rate and almost nothing we sent was ACKed any more (about one retry per frame),
+while the stack kept showing "connected" until the connection was restarted by hand. The driver now watches
+the retry counters in 12 s windows (windows containing a scan are ignored, scans always cost a burst of
+retries). A window with retries >= 70% of the frames sent triggers an SA Query probe; no answer drops the
+link, and if the AP answers but the link stays that bad for 3 windows (about 36 s) the link is dropped
+anyway, so wpa_supplicant reconnects (a few seconds). Module parameter `re_pmf_stall`: `1` (default) = on,
+`0` = off, `2` = test mode (every window counts as bad, for exercising the recovery). The cause of the rate
+runaway itself is not understood (it was seen 4 times in about 60 scans with the Block-Ack handling above, and
+never in about 150 scans without it).
+
 ### Replacing Ubuntu/Debian's stock `wl` (broadcom-sta-dkms) permanently
 Both packages provide a module named `wl`, so the stock one has to go. In the repo directory:
 ```sh

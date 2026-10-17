@@ -1173,6 +1173,7 @@ static int wl_re_send_protected_deauth(struct net_device *dev, u16 reason);   /*
 static void wl_re_dd_work(struct work_struct *w);
 static void wl_re_assoc_lost(struct net_device *dev, u16 reason, const char *why);
 static void wl_re_saq_chk_work(struct work_struct *w);
+void wl_re_link_tick(struct net_device *dev, unsigned long tx, unsigned long retry);
 static void wl_re_fast_key(const u8 *tk);
 static void wl_re_crypto_exit(void);
 
@@ -2664,6 +2665,9 @@ static int wl_re_ccm(bool enc, const u8 *nonce, const u8 *aad, unsigned aadlen, 
 int re_pmf_ba = 2;
 module_param(re_pmf_ba, int, 0644);
 MODULE_PARM_DESC(re_pmf_ba, "802.11w Block Ack: 0=off, 1=decline the AP's ADDBA, 2=full (default)");
+int re_pmf_stall = 1;
+module_param(re_pmf_stall, int, 0644);
+MODULE_PARM_DESC(re_pmf_stall, "probe the AP and reconnect when a PMF link retries most of its frames for 12 s (1=on, 0=off, 2=test: treat every window as bad)");
 unsigned int re_ba_rxclr;
 module_param(re_ba_rxclr, uint, 0644);
 MODULE_PARM_DESC(re_ba_rxclr, "debug: RxStatus1 bits to clear on re-injected Block-Ack frames");
@@ -3010,6 +3014,74 @@ static void wl_re_saq_send(struct net_device *dev)
 	re_log("re: SA-Query request #%d tid=%04x -> %d\n", wl_sae.saq_tries, wl_sae.saq_tid, rc);
 }
 
+/* Stalled-link detector, called once a second from the driver watchdog with the interface's frame
+ * counters. A PMF link can go bad without any deauth we would notice: the blob's rate control runs
+ * away to the top rate (1300 Mbit/s) after a scan, almost nothing we send is ACKed any more (about
+ * one retry per frame or worse, while the frames from the AP still trickle in), and the stack keeps
+ * showing "connected" (seen in soak tests: 90 s+ of dead link, no recovery without a manual
+ * reconnect). Judge 12 s windows (not the ones with a scan in them: those always show a burst of
+ * retries). A window with retries >= 70% of the frames sent makes us probe the AP with an SA Query:
+ * silence drops the link. If the probe is answered but the link stays that bad for 3 windows in a
+ * row, drop it anyway: a fresh association resets the blob's per-station state. */
+#define WL_STALL_WINDOW_S	12
+#define WL_STALL_MIN_RETRY	40
+#define WL_STALL_PROBE_GAP_S	30
+#define WL_STALL_FORCE_WINDOWS	3
+void wl_re_link_tick(struct net_device *dev, unsigned long tx, unsigned long retry)
+{
+	static unsigned long w_tx, w_retry, scan_seen, last_probe;
+	static unsigned int ticks, bad;
+	struct wl_cfg80211_priv *wl;
+	unsigned long dtx, dretry;
+
+	if (!wl_sae.inited || dev != wl_sae.dev || !wl_sae.pmf_active || !wl_sae.tk_set || re_pmf_stall == 0) {
+		ticks = 0; bad = 0;
+		return;
+	}
+	wl = ndev_to_wl(dev);
+	if (!test_bit(WL_STATUS_CONNECTED, &wl->status)) {
+		ticks = 0; bad = 0;
+		return;
+	}
+	if (wl->scan_request)
+		scan_seen = jiffies;
+	if (ticks == 0) {
+		w_tx = tx;
+		w_retry = retry;
+	}
+	if (++ticks < WL_STALL_WINDOW_S)
+		return;
+	ticks = 0;
+	dtx = tx - w_tx;
+	dretry = retry - w_retry;
+	if (re_pmf_stall == 2)                 /* test mode: pretend every window is bad */
+		dretry = WL_STALL_MIN_RETRY + 2 * dtx;
+	else if (time_before(jiffies, scan_seen + (WL_STALL_WINDOW_S + 3) * HZ)) {
+		bad = 0;                       /* a scan always costs a burst of retries */
+		return;
+	}
+	if (dretry < WL_STALL_MIN_RETRY || dretry * 10 < dtx * 7) {
+		bad = 0;
+		return;
+	}
+	bad++;
+	re_log("re: link stall? %lu retries for %lu frames in %d s (window %u)\n",
+	       dretry, dtx, WL_STALL_WINDOW_S, bad);
+	if (wl_sae.dd_busy || wl_sae.saq_pending)
+		return;
+	if (bad >= WL_STALL_FORCE_WINDOWS) {
+		bad = 0;
+		wl_sae.dd_kind = 2;            /* drop the link */
+	} else if (time_after(jiffies, last_probe + WL_STALL_PROBE_GAP_S * HZ)) {
+		last_probe = jiffies;
+		wl_sae.dd_kind = 1;            /* SA Query */
+	} else {
+		return;
+	}
+	wl_sae.dd_busy = true;
+	schedule_work(&wl_sae.dd_work);
+}
+
 /* 802.11w 11.13: an unprotected "class 2/3" deauth must not be obeyed, but the association has to be
  * verified. Ask the AP; a valid protected response means it is alive (ignore the frame), silence
  * means it dropped us and we must reconnect. */
@@ -3057,7 +3129,11 @@ static void wl_re_dd_work(struct work_struct *w)
 	if (!dev || !wl_sae.pmf_active)
 		goto done;
 	if (wl_sae.dd_kind == 1) {
-		wl_re_saq_start(dev, "link check after resume");
+		wl_re_saq_start(dev, "link check (after resume / retries)");
+		goto done;
+	}
+	if (wl_sae.dd_kind == 2) {
+		wl_re_assoc_lost(dev, WLAN_REASON_UNSPECIFIED, "most transmissions fail, link unusable");
 		goto done;
 	}
 	if (flen < 26)

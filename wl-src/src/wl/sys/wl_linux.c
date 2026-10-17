@@ -3445,6 +3445,7 @@ wl_report_radio_state(wl_info_t *wl)
 #endif 
 
 static unsigned int re_tick;   /* watchdog ticks (1/s) for the re_verbose>=2 stats line */
+extern void wl_re_link_tick(struct net_device *dev, unsigned long tx, unsigned long retry);
 
 static int
 wl_linux_watchdog(void *ctx)
@@ -3492,14 +3493,21 @@ wl_linux_watchdog(void *ctx)
 					 * health changes, e.g. around a group-key rekey */
 					if (re_verbose >= 2 && wl->pub->_cnt && (++re_tick % 5) == 0) {
 						wl_cnt_t *c = wl->pub->_cnt;
-						int pm = -1;
+						int pm = -1, rate = -1, noise = 0;
+						struct { int hw, target, scan; } ch = { -1, -1, -1 };
 						wlc_get(wl->wlc, WLC_GET_PM, &pm);
+						wlc_get(wl->wlc, WLC_GET_RATE, &rate);
+						wlc_get(wl->wlc, WLC_GET_PHY_NOISE, &noise);
+						wlc_ioctl(wl->wlc, WLC_GET_CHANNEL, &ch, sizeof(ch), NULL);
 						printk(KERN_ERR "re: stat pm=%d tx=%lu rx=%lu txfail=%u retry=%u noack=%u "
-						       "rxundec=%u/%u ccmpundec=%u/%u replay=%u/%u rxcrc=%u\n", pm,
+						       "rxundec=%u/%u ccmpundec=%u/%u replay=%u/%u rxcrc=%u rate=%d noise=%d "
+						       "chan=%d/%d/%d\n", pm,
 						       stats->tx_packets, stats->rx_packets, c->txfail, c->txretry,
 						       c->txnoack, c->rxundec, c->rxundec_mcst, c->ccmpundec,
-						       c->ccmpundec_mcst, c->ccmpreplay, c->ccmpreplay_mcst, c->rxcrc);
+						       c->ccmpundec_mcst, c->ccmpreplay, c->ccmpreplay_mcst, c->rxcrc,
+						       rate, noise, ch.hw, ch.target, ch.scan);
 					}
+					wl_re_link_tick(wlif->dev, stats->tx_packets, WLCNTVAL(wl->pub->_cnt->txretry));
 				}
 
 #ifdef USE_IW
