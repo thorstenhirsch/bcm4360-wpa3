@@ -1149,6 +1149,15 @@ static struct {
 	int  saq_tries;
 	u64  rx_mgmt_pn;               /* last accepted PN of the AP's protected deauth/disassoc */
 	bool stub_seen;     /* the blob has sent its own stub auth frame for this join */
+	atomic_t txfail_cnt;           /* WLC_E_TXFAIL events seen (a frame the AP never ACKed) */
+	u32  assoc_status;             /* 802.11 status code of the last association response (WLC_E_ASSOC) */
+	struct delayed_work retry_work; /* retry a join the AP answered with status 30 */
+	struct delayed_work hs_wd;     /* 4-way handshake watchdog */
+	u8   join_buf[128];            /* the WLC_SET_SSID request of the current connect, for retries */
+	size_t join_len;
+	int  retries;                  /* internal join retries used for this connect */
+	bool ptk_done;                 /* pairwise key installed = 4-way handshake completed */
+	unsigned long last_disc;       /* jiffies of the last disconnect */
 	bool sae_conn;      /* current connect request is WPA3-SAE (set in .connect) */
 	bool sae_ok;        /* host SAE finished OK (.external_auth status 0) for this connection */
 	u32  freq;          /* MHz of the connect channel (0 = unknown) */
@@ -1160,6 +1169,7 @@ static struct {
 static void wl_re_saq_work(struct work_struct *w);   /* SW SA-Query responder (defined below) */
 static int wl_re_send_protected_deauth(struct net_device *dev, u16 reason);   /* defined below */
 static void wl_re_dd_work(struct work_struct *w);
+static void wl_re_assoc_lost(struct net_device *dev, u16 reason, const char *why);
 static void wl_re_saq_chk_work(struct work_struct *w);
 
 /* After the host SAE succeeds we drive the blob into association (wl_re_drive_assoc). With this
@@ -1176,6 +1186,63 @@ static void wl_re_saq_chk_work(struct work_struct *w);
 #define WL_SAE_STUB_GRACE_MS		40
 #define WL_SAE_START_FALLBACK_MS	500
 #define WL_SAE_ASSOC_TIMEOUT_MS	3000
+
+/* Tunables (ms). A full reconnect should neither be needlessly fast nor ever slow: these keep every
+ * step bounded. */
+#define WL_DEAUTH_SETTLE_MS	40	/* after our protected deauth, to see whether it was ACKed */
+#define WL_MIN_REJOIN_GAP_MS	2000	/* quiet time after a disconnect before the next join */
+#define WL_SAE_RETRY_DELAY_MS	1000	/* before retrying a failed join */
+#define WL_SAE_MAX_RETRIES	3
+#define WL_HS_TIMEOUT_MS	3500	/* association accepted but no 4-way handshake after this long */
+
+/* A join the firmware reports as failed (WLC_E_SET_SSID / FAIL, as opposed to "no network found").
+ * Seen when re-joining the BSS we just left, with WPA2-PSK as well as with SAE: the AP either answers
+ * the association request with status 30 ("rejected temporarily, try again later") or does not answer
+ * the authentication at all for a moment.
+ * Reporting the failure sends wpa_supplicant on a ~3.5 s scan, a hop to the other band and, in 2 of 5
+ * cases, a 10 s wait for a 4-way handshake that never starts. Wait a moment and join the same BSS
+ * again, silently (bounded: WL_SAE_MAX_RETRIES times, then the failure is reported as before). */
+static void wl_sae_retry_work(struct work_struct *w)
+{
+	struct net_device *dev = wl_sae.dev;
+	struct wl_cfg80211_priv *wl;
+	int err;
+
+	if (!dev || !wl_sae.join_len)
+		return;
+	wl = ndev_to_wl(dev);
+	if (!test_bit(WL_STATUS_CONNECTING, &wl->status))
+		return;
+	wl_sae.retries++;
+	wl_sae.assoc_status = 0;
+	re_log("re: retrying the join (#%d) after the AP's 'try again later'\n", wl_sae.retries);
+	if (wl_sae.sae_conn) {   /* SAE: a fresh host-driven exchange; other joins are fully blob-driven */
+		wl_sae.sae_ok = false;
+		wl_sae.stub_seen = false;
+		wl_re_release_assoc_ie();
+		wl_sae.armed = 1;
+		schedule_delayed_work(&wl_sae.work, msecs_to_jiffies(WL_SAE_START_FALLBACK_MS));
+	}
+	err = wl_dev_ioctl(dev, WLC_SET_SSID, wl_sae.join_buf, wl_sae.join_len);
+	if (err) {
+		re_log("re: join retry failed (%d) -> reporting the failure\n", err);
+		if (test_and_clear_bit(WL_STATUS_CONNECTING, &wl->status))
+			cfg80211_connect_result(dev, wl_sae.bssid, NULL, 0, NULL, 0,
+			                        WLAN_STATUS_AUTH_TIMEOUT, GFP_KERNEL);
+	}
+}
+
+/* The association was accepted but the AP never starts the 4-way handshake (seen right after a
+ * rejected join); wpa_supplicant would wait its full 10 s. Give it a bounded time, then drop the link
+ * so it retries at once. */
+static void wl_sae_hs_wd_work(struct work_struct *w)
+{
+	struct net_device *dev = wl_sae.dev;
+
+	if (!dev || wl_sae.ptk_done)
+		return;
+	wl_re_assoc_lost(dev, WLAN_REASON_4WAY_HANDSHAKE_TIMEOUT, "no 4-way handshake after association");
+}
 static void wl_sae_assoc_wd_work(struct work_struct *w)
 {
 	struct net_device *dev = wl_sae.dev;
@@ -1267,11 +1334,26 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 		INIT_DELAYED_WORK(&wl_sae.assoc_wd, wl_sae_assoc_wd_work);
 		INIT_WORK(&wl_sae.dd_work, wl_re_dd_work);
 		INIT_DELAYED_WORK(&wl_sae.saq_chk, wl_re_saq_chk_work);
+		INIT_DELAYED_WORK(&wl_sae.retry_work, wl_sae_retry_work);
+		INIT_DELAYED_WORK(&wl_sae.hs_wd, wl_sae_hs_wd_work);
+		atomic_set(&wl_sae.txfail_cnt, 0);
 		wl_sae.tx_pn = 0x1000000;   /* start well above any short-session data PN */
 		wl_sae.inited = true;
 	}
 	wl_sae.dev = dev;
 	cancel_delayed_work_sync(&wl_sae.work);       /* a start scheduled by a previous attempt */
+	cancel_delayed_work_sync(&wl_sae.retry_work);
+	cancel_delayed_work_sync(&wl_sae.hs_wd);
+	wl_sae.assoc_status = 0;
+	wl_sae.retries = 0;
+	wl_sae.ptk_done = false;
+	/* quiet time after the last disconnect: the AP needs a moment to finish with the old association */
+	if (wl_sae.last_disc && time_before(jiffies, wl_sae.last_disc + msecs_to_jiffies(WL_MIN_REJOIN_GAP_MS))) {
+		unsigned int ms = jiffies_to_msecs(wl_sae.last_disc + msecs_to_jiffies(WL_MIN_REJOIN_GAP_MS) - jiffies);
+
+		re_log("re: waiting %u ms after the last disconnect before joining\n", ms);
+		msleep(ms);
+	}
 	cancel_delayed_work_sync(&wl_sae.assoc_wd);   /* stale watchdog of a previous attempt */
 	cancel_delayed_work_sync(&wl_sae.saq_chk);
 	wl_sae.saq_pending = false;
@@ -1350,6 +1432,12 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 		WL_DBG(("ssid \"%s\", len (%d)\n", join_params.ssid.SSID,
 		        join_params.ssid.SSID_len));
 	}
+	if (join_params_size <= sizeof(wl_sae.join_buf)) {
+		memcpy(wl_sae.join_buf, &join_params, join_params_size);
+		wl_sae.join_len = join_params_size;
+	} else {
+		wl_sae.join_len = 0;
+	}
 	err = wl_dev_ioctl(dev, WLC_SET_SSID, &join_params, join_params_size);
 	if (err) {
 		WL_ERR(("error (%d)\n", err));
@@ -1391,10 +1479,13 @@ wl_cfg80211_disconnect(struct wiphy *wiphy, struct net_device *dev, u16 reason_c
 
 	bool pmf = wl_sae.pmf_active;
 
+	wl_sae.last_disc = jiffies;
 	wl_sae.armed = 0;       /* disarm SAE hooks on disconnect */
 	if (wl_sae.inited) {
 		cancel_delayed_work_sync(&wl_sae.assoc_wd);
 		cancel_delayed_work_sync(&wl_sae.saq_chk);
+		cancel_delayed_work_sync(&wl_sae.retry_work);
+		cancel_delayed_work_sync(&wl_sae.hs_wd);
 	}
 	wl_sae.saq_pending = false;
 	wl_re_release_assoc_ie();
@@ -1409,11 +1500,25 @@ wl_cfg80211_disconnect(struct wiphy *wiphy, struct net_device *dev, u16 reason_c
 		 * association, which then makes the next join to that BSS stall or get rejected. Tell it
 		 * properly with a CCMP-protected deauth (software CCMP, like the SA-Query response). */
 		if (pmf && wl_sae.tk_set) {
-			int rc = wl_re_send_protected_deauth(dev, reason_code ? reason_code :
-			                                     WLAN_REASON_DEAUTH_LEAVING);
-			re_log("re: protected deauth -> %d\n", rc);
-			if (!rc)
-				msleep(30);   /* let it leave the air before the radio state is torn down */
+			int try, rc;
+
+			/* The blob gives up on a frame after a few un-ACKed attempts and only tells us with a
+			 * WLC_E_TXFAIL event. A deauth the AP never received leaves it holding the old
+			 * association (-> "try again later" on the next join), so look for that event and
+			 * retransmit before tearing the radio state down. */
+			for (try = 0; try < 3; try++) {
+				int before = atomic_read(&wl_sae.txfail_cnt);
+
+				rc = wl_re_send_protected_deauth(dev, reason_code ? reason_code :
+				                                 WLAN_REASON_DEAUTH_LEAVING);
+				re_log("re: protected deauth #%d -> %d\n", try + 1, rc);
+				if (rc)
+					break;
+				msleep(WL_DEAUTH_SETTLE_MS);   /* time to leave the air, and for a TXFAIL to be reported */
+				if (atomic_read(&wl_sae.txfail_cnt) == before)
+					break;          /* no TX failure reported: the AP ACKed it */
+				re_log("re: protected deauth was not acknowledged -> retransmitting\n");
+			}
 			wl_sae.tk_set = false;
 		}
 		memcpy(&scbval.ea, &wl->bssid, ETHER_ADDR_LEN);
@@ -1606,6 +1711,8 @@ wl_cfg80211_add_key(struct wiphy *wiphy, struct net_device *dev,
 		memcpy(wl_sae.tk, params->key, 16);
 		wl_sae.tk_set = true;
 		re_log("re add_key: captured pairwise CCMP TK for SW mgmt crypto\n");
+		wl_sae.ptk_done = true;
+		cancel_delayed_work(&wl_sae.hs_wd);
 	}
 
 	memset(&key, 0, sizeof(key));
@@ -3595,6 +3702,16 @@ wl_bss_connect_done(struct wl_cfg80211_priv *wl, struct net_device *ndev,
 		wl->scan_request = NULL;
 	}
 
+	if (!completed && EVENT_TYPE(e) == WLC_E_SET_SSID && EVENT_STATUS(e) == WLC_E_STATUS_FAIL &&
+	    wl_sae.join_len && wl_sae.retries < WL_SAE_MAX_RETRIES &&
+	    test_bit(WL_STATUS_CONNECTING, &wl->status)) {
+		re_log("re: join failed (AP status %u): retrying in %d ms\n", wl_sae.assoc_status,
+		       WL_SAE_RETRY_DELAY_MS);
+		wl_sae.assoc_status = 0;
+		cancel_delayed_work(&wl_sae.assoc_wd);   /* the retry has its own timing */
+		schedule_delayed_work(&wl_sae.retry_work, msecs_to_jiffies(WL_SAE_RETRY_DELAY_MS));
+		return err;
+	}
 	if (test_and_clear_bit(WL_STATUS_CONNECTING, &wl->status)) {
 		if (completed) {
 			wl_get_assoc_ies(wl);
@@ -3641,6 +3758,9 @@ wl_bss_connect_done(struct wl_cfg80211_priv *wl, struct net_device *ndev,
 				cfg80211_put_bss(wl_to_wiphy(wl), b);
 			}
 			set_bit(WL_STATUS_CONNECTED, &wl->status);
+			/* ptk_done is reset in .connect; the key may already be in by now */
+			if (wl_sae.sae_conn && !wl_sae.ptk_done)
+				schedule_delayed_work(&wl_sae.hs_wd, msecs_to_jiffies(WL_HS_TIMEOUT_MS));
 		}
 
 		WL_DBG(("Reporting BSS network join result \"%s\"\n",
@@ -3942,6 +4062,8 @@ void wl_cfg80211_detach(struct net_device *ndev)
 		cancel_delayed_work_sync(&wl_sae.work);
 		cancel_delayed_work_sync(&wl_sae.assoc_wd);
 		cancel_delayed_work_sync(&wl_sae.saq_chk);
+		cancel_delayed_work_sync(&wl_sae.retry_work);
+		cancel_delayed_work_sync(&wl_sae.hs_wd);
 		cancel_work_sync(&wl_sae.saq_work);
 		cancel_work_sync(&wl_sae.dd_work);
 	}
@@ -3988,6 +4110,10 @@ wl_cfg80211_event(struct net_device *ndev, const wl_event_msg_t * e, void *data)
 
 	struct wl_cfg80211_priv *wl = ndev_to_wl(ndev);
 	/* every firmware event (TXFAIL, MIC_ERROR, PSK_SUP, DEAUTH, ...), verbose only; scan results are noise */
+	if (event_type == WLC_E_TXFAIL)
+		atomic_inc(&wl_sae.txfail_cnt);
+	else if (event_type == WLC_E_ASSOC)
+		wl_sae.assoc_status = dtoh32(e->reason);   /* 802.11 status code from the AP's response */
 	if (event_type != WLC_E_SCAN_COMPLETE)
 		re_log("re: fw event %u status=%u reason=%u flags=0x%x\n", event_type, EVENT_STATUS(e),
 		       dtoh32(e->reason), EVENT_FLAGS(e));
