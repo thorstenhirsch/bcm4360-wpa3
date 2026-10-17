@@ -2598,6 +2598,21 @@ static void wl_re_ccmp_blocks(const u8 *h, const u8 *pn, u8 *nonce, u8 *aad)
 static struct crypto_aead *wl_saq_tfm;   /* cached AES-CCM tfm (alloc once; serialized use) */
 static DEFINE_MUTEX(wl_saq_lock);        /* tfm + its key are shared by the SA-Query worker and the deauth */
 
+/* Lazily allocate the AES-CCM tfm once (process context) and key it with the current TK (cheap, done
+ * per call). Caller holds wl_saq_lock. */
+static int wl_re_ccm_setup(void)
+{
+	if (!wl_saq_tfm) {
+		wl_saq_tfm = crypto_alloc_aead("ccm(aes)", 0, 0);
+		if (IS_ERR(wl_saq_tfm)) {
+			wl_saq_tfm = NULL;
+			return -ENOMEM;
+		}
+		crypto_aead_setauthsize(wl_saq_tfm, 8);
+	}
+	return crypto_aead_setkey(wl_saq_tfm, wl_sae.tk, 16);
+}
+
 /* in-place AES-CCM over a fresh [aad||data] buffer using the cached, pre-keyed tfm.
  * enc: data=pt(dlen) -> ct(dlen)+MIC(8). dec: data=ct(dlen)+MIC(8) -> pt(dlen). 0 on success. */
 static int wl_re_ccm(bool enc, const u8 *nonce, const u8 *aad, unsigned aadlen,
@@ -2642,13 +2657,7 @@ static void wl_re_saq_work(struct work_struct *w)
 		goto done;
 	mutex_lock(&wl_saq_lock);
 	locked = true;
-	/* lazily allocate the AES-CCM tfm once (process context), re-key per call (cheap) */
-	if (!wl_saq_tfm) {
-		wl_saq_tfm = crypto_alloc_aead("ccm(aes)", 0, 0);
-		if (IS_ERR(wl_saq_tfm)) { wl_saq_tfm = NULL; goto done; }
-		crypto_aead_setauthsize(wl_saq_tfm, 8);
-	}
-	if (crypto_aead_setkey(wl_saq_tfm, wl_sae.tk, 16))
+	if (wl_re_ccm_setup())
 		goto done;
 	ctlen = (int)flen - 4 /*FCS*/ - 24 - 8 - 8;
 	if (ctlen <= 0 || ctlen > 60)
@@ -2718,16 +2727,7 @@ static int wl_re_send_protected_mgmt(struct net_device *dev, u8 fc0, const u8 *b
 	if (!wl_sae.tk_set || blen == 0 || blen > 16)
 		return -ENOENT;
 	mutex_lock(&wl_saq_lock);
-	if (!wl_saq_tfm) {
-		wl_saq_tfm = crypto_alloc_aead("ccm(aes)", 0, 0);
-		if (IS_ERR(wl_saq_tfm)) {
-			wl_saq_tfm = NULL;
-			rc = -ENOMEM;
-			goto out;
-		}
-		crypto_aead_setauthsize(wl_saq_tfm, 8);
-	}
-	rc = crypto_aead_setkey(wl_saq_tfm, wl_sae.tk, 16);
+	rc = wl_re_ccm_setup();
 	if (rc)
 		goto out;
 
@@ -2875,12 +2875,7 @@ static void wl_re_dd_work(struct work_struct *w)
 	}
 	mutex_lock(&wl_saq_lock);
 	locked = true;
-	if (!wl_saq_tfm) {
-		wl_saq_tfm = crypto_alloc_aead("ccm(aes)", 0, 0);
-		if (IS_ERR(wl_saq_tfm)) { wl_saq_tfm = NULL; goto done; }
-		crypto_aead_setauthsize(wl_saq_tfm, 8);
-	}
-	if (crypto_aead_setkey(wl_saq_tfm, wl_sae.tk, 16))
+	if (wl_re_ccm_setup())
 		goto done;
 	wl_re_ccmp_blocks(f, pn, nonce, aad);
 	memcpy(buf, f + 32, 2 + 8);
