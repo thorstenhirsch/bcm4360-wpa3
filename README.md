@@ -137,6 +137,15 @@ echo 2 | sudo tee /sys/module/wl/parameters/re_verbose          # + the blob's T
 echo 'options wl re_verbose=1' | sudo tee /etc/modprobe.d/wl-debug.conf   # permanent
 ```
 
+### Throughput with PMF (WPA3) and Block Ack
+With 802.11w the AP protects its Block-Ack action frames (ADDBA/DELBA), which the blob cannot
+decrypt, and drops the blob's own unprotected ones. Without a Block-Ack agreement there is no frame
+aggregation and the AP keeps re-sending its ADDBA Request: SAE ran at about 14 Mbit/s with 17% TX
+retries where WPA2-PSK reached about 190 Mbit/s. The driver now decrypts the AP's Block-Ack frames in
+software and hands them to the blob, and CCMP-protects the blob's own, so the agreement is set up
+normally (SAE 150-210 Mbit/s down, 0% retries on the same link). Module parameter `re_pmf_ba`:
+`2` (default) = full, `1` = decline the AP's ADDBA (no aggregation), `0` = off.
+
 ### Replacing Ubuntu/Debian's stock `wl` (broadcom-sta-dkms) permanently
 Both packages provide a module named `wl`, so the stock one has to go. In the repo directory:
 ```sh
@@ -194,9 +203,9 @@ If the AP uses the same SSID on 2.4 and 5 GHz, wpa_supplicant picks the stronger
 - Re-joining the BSS you just left is the AP's weak spot (FRITZ!Box: "try again later" / no answer in
   30-40% of back-to-back reconnects). The driver absorbs it; the cost is an occasional ~5 s reconnect instead
   of ~1-2 s. WPA2-PSK median 1.7 s, max 5.4 s; SAE 0.3-1.1 s in 16-cycle stress tests.
-- In PMF sessions 10-30% of transmitted frames are retried (about 0% with WPA2-PSK); throughput was not
-  measured. The AP's protected Block-Ack setup requests (ADDBA) are swallowed unanswered (the blob cannot
-  decrypt them), so frame aggregation is probably not in use with a PMF AP.
+- The blob knows nothing about 802.11w, so the driver handles the PMF parts of the Block-Ack setup in
+  software (see below). If the module cannot get a synchronous `ccm(aes)` implementation, that is
+  disabled and SAE/PMF sessions run without frame aggregation (slow). `re_pmf_ba=0` turns it off.
 - Not tested: a WPA3-only AP on this version, other APs than the FRITZ!Box 6690, 6.12-7.2 beyond building.
 
 ## Tested

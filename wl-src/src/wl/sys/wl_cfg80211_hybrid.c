@@ -1131,7 +1131,8 @@ static struct {
 	u8  igtk_ipn[6];    /* IGTK packet number (replay) */
 	u8  tk[16];         /* pairwise CCMP temporal key (PTK TK) for SW mgmt-frame crypto */
 	bool tk_set;
-	u64 tx_pn;          /* our TX PN for SW-protected mgmt frames (SA-Query Response) */
+	atomic64_t tx_pn;   /* our TX PN for SW-protected mgmt frames (SA-Query Response, Block Ack) */
+	u64 rx_ba_pn;       /* last accepted PN of the AP's protected Block-Ack action frames */
 	struct delayed_work assoc_wd;  /* association watchdog: see wl_sae_assoc_wd_work() */
 	struct work_struct saq_work;   /* deferred SA-Query handler (RX path is atomic) */
 	u8  saq_frame[320];
@@ -1172,6 +1173,8 @@ static int wl_re_send_protected_deauth(struct net_device *dev, u16 reason);   /*
 static void wl_re_dd_work(struct work_struct *w);
 static void wl_re_assoc_lost(struct net_device *dev, u16 reason, const char *why);
 static void wl_re_saq_chk_work(struct work_struct *w);
+static void wl_re_fast_key(const u8 *tk);
+static void wl_re_crypto_exit(void);
 
 /* After the host SAE succeeds we drive the blob into association (wl_re_drive_assoc). With this
  * blob the association request sometimes never completes (seen with the original code too, ~50%
@@ -1379,7 +1382,7 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 		INIT_DELAYED_WORK(&wl_sae.join_work, wl_sae_join_work);
 		INIT_DELAYED_WORK(&wl_sae.hs_wd, wl_sae_hs_wd_work);
 		atomic_set(&wl_sae.txfail_cnt, 0);
-		wl_sae.tx_pn = 0x1000000;   /* start well above any short-session data PN */
+		atomic64_set(&wl_sae.tx_pn, 0x1000000);   /* start well above any short-session data PN */
 		wl_sae.inited = true;
 	}
 	wl_sae.dev = dev;
@@ -1394,6 +1397,7 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 	cancel_delayed_work_sync(&wl_sae.saq_chk);
 	wl_sae.saq_pending = false;
 	wl_sae.rx_mgmt_pn = 0;
+	wl_sae.rx_ba_pn = 0;
 	wl_re_release_assoc_ie();   /* a WPA2 connect must not reuse the previous SAE RSN IE */
 	wl_sae.sae_conn = wl_sme_is_sae(sme);
 	wl_sae.sae_ok = false;
@@ -1763,6 +1767,7 @@ wl_cfg80211_add_key(struct wiphy *wiphy, struct net_device *dev,
 	    params->key && params->key_len == 16) {
 		memcpy(wl_sae.tk, params->key, 16);
 		wl_sae.tk_set = true;
+		wl_re_fast_key(wl_sae.tk);
 		re_log("re add_key: captured pairwise CCMP TK for SW mgmt crypto\n");
 		wl_sae.ptk_done = true;
 		cancel_delayed_work(&wl_sae.hs_wd);
@@ -2613,23 +2618,24 @@ static int wl_re_ccm_setup(void)
 	return crypto_aead_setkey(wl_saq_tfm, wl_sae.tk, 16);
 }
 
-/* in-place AES-CCM over a fresh [aad||data] buffer using the cached, pre-keyed tfm.
+/* in-place AES-CCM over a fresh [aad||data] buffer using a pre-keyed tfm.
  * enc: data=pt(dlen) -> ct(dlen)+MIC(8). dec: data=ct(dlen)+MIC(8) -> pt(dlen). 0 on success. */
-static int wl_re_ccm(bool enc, const u8 *nonce, const u8 *aad, unsigned aadlen,
-                     u8 *data, unsigned dlen)
+static int wl_re_ccm_with(struct crypto_aead *tfm, gfp_t gfp, bool enc, const u8 *nonce, const u8 *aad,
+                          unsigned aadlen, u8 *data, unsigned dlen)
 {
 	struct aead_request *req; struct scatterlist sg;
 	u8 iv[16]; u8 *buf; int ret = -1; unsigned cl = dlen + 8;
-	if (!wl_saq_tfm)
+	if (!tfm)
 		return -1;
-	req = aead_request_alloc(wl_saq_tfm, GFP_KERNEL);
+	req = aead_request_alloc(tfm, gfp);
 	if (!req) return -1;
 	iv[0] = 1; memcpy(iv + 1, nonce, 13); iv[14] = 0; iv[15] = 0;
-	buf = kmalloc(aadlen + cl, GFP_KERNEL);
+	buf = kmalloc(aadlen + cl, gfp);
 	if (!buf) goto out_req;
 	memcpy(buf, aad, aadlen);
 	memcpy(buf + aadlen, data, enc ? dlen : cl);
 	sg_init_one(&sg, buf, aadlen + cl);
+	aead_request_set_callback(req, 0, NULL, NULL);
 	aead_request_set_ad(req, aadlen);
 	aead_request_set_crypt(req, &sg, &sg, enc ? dlen : cl, iv);
 	ret = enc ? crypto_aead_encrypt(req) : crypto_aead_decrypt(req);
@@ -2641,10 +2647,197 @@ out_req:
 	return ret;
 }
 
+static int wl_re_ccm(bool enc, const u8 *nonce, const u8 *aad, unsigned aadlen, u8 *data, unsigned dlen)
+{
+	return wl_re_ccm_with(wl_saq_tfm, GFP_KERNEL, enc, nonce, aad, aadlen, data, dlen);
+}
+
+/* ===== Block Ack (ADDBA/DELBA) through PMF =====
+ * With 802.11w the AP protects its Block-Ack action frames (robust category 3), which the blob
+ * cannot decrypt, and the AP drops the blob's own unprotected ones. Without a Block-Ack agreement
+ * there is no frame aggregation and the AP keeps re-sending its ADDBA Request (seen: 14 Mbit/s
+ * instead of ~190). These frames are handled in the blob's RX/TX context (atomic), so they need a
+ * synchronous AES-CCM tfm of their own, used under a spinlock.
+ *   re_pmf_ba = 0: off (old behaviour), 1: decline the AP's ADDBA (protected response, no aggregation),
+ *               2: decrypt the AP's Block-Ack frames for the blob and protect the blob's ones.
+ *   re_ba_rxclr: RxStatus1 bits to clear in the rx header of a re-injected frame (diagnostic). */
+int re_pmf_ba = 2;
+module_param(re_pmf_ba, int, 0644);
+MODULE_PARM_DESC(re_pmf_ba, "802.11w Block Ack: 0=off, 1=decline the AP's ADDBA, 2=full (default)");
+unsigned int re_ba_rxclr;
+module_param(re_ba_rxclr, uint, 0644);
+MODULE_PARM_DESC(re_ba_rxclr, "debug: RxStatus1 bits to clear on re-injected Block-Ack frames");
+
+static struct crypto_aead *wl_re_fast_tfm;
+static DEFINE_SPINLOCK(wl_re_fast_lock);
+static bool wl_re_fast_ok;
+
+static void wl_re_fast_key(const u8 *tk)
+{
+	unsigned long fl;
+
+	if (!wl_re_fast_tfm) {
+		struct crypto_aead *t = crypto_alloc_aead("ccm(aes)", 0, CRYPTO_ALG_ASYNC);
+
+		if (IS_ERR(t)) {
+			re_log("re ba: no synchronous ccm(aes) (%ld) -> Block Ack under PMF disabled\n", PTR_ERR(t));
+			return;
+		}
+		crypto_aead_setauthsize(t, 8);
+		wl_re_fast_tfm = t;
+	}
+	spin_lock_irqsave(&wl_re_fast_lock, fl);
+	wl_re_fast_ok = crypto_aead_setkey(wl_re_fast_tfm, tk, 16) == 0;
+	spin_unlock_irqrestore(&wl_re_fast_lock, fl);
+}
+
+static void wl_re_crypto_exit(void)
+{
+	unsigned long fl;
+	struct crypto_aead *t;
+
+	spin_lock_irqsave(&wl_re_fast_lock, fl);
+	wl_re_fast_ok = false;
+	t = wl_re_fast_tfm;
+	wl_re_fast_tfm = NULL;
+	spin_unlock_irqrestore(&wl_re_fast_lock, fl);
+	if (t)
+		crypto_free_aead(t);
+	if (wl_saq_tfm) {
+		crypto_free_aead(wl_saq_tfm);
+		wl_saq_tfm = NULL;
+	}
+}
+
+/* atomic-context AES-CCM with the synchronous tfm; dlen <= 48 */
+static int wl_re_ccm_fast(bool enc, const u8 *nonce, const u8 *aad, u8 *data, unsigned dlen)
+{
+	unsigned long fl;
+	int ret;
+
+	if (dlen > 48)
+		return -EMSGSIZE;
+	spin_lock_irqsave(&wl_re_fast_lock, fl);
+	ret = wl_re_fast_ok ? wl_re_ccm_with(wl_re_fast_tfm, GFP_ATOMIC, enc, nonce, aad, 22, data, dlen) : -ENOKEY;
+	spin_unlock_irqrestore(&wl_re_fast_lock, fl);
+	return ret;
+}
+
+static inline u64 wl_re_ccmp_pn(const u8 *p)   /* PN from the 8-byte CCMP header */
+{
+	return (u64)p[0] | (u64)p[1] << 8 | (u64)p[4] << 16 | (u64)p[5] << 24 | (u64)p[6] << 32 | (u64)p[7] << 40;
+}
+
+/* RX, atomic context. skb->data + q = protected action frame from the AP (24B header, CCMP header,
+ * ciphertext, MIC, FCS). Returns 1 if it was a Block-Ack frame and the skb now holds the same frame
+ * unprotected and in plaintext (hand it to the blob), -1 to drop it, 0 if it is not for us. */
+static int wl_re_ba_rx(struct sk_buff *skb, unsigned int q)
+{
+	u8 *p = skb->data + q;
+	unsigned int flen = skb->len - q;
+	u8 nonce[13], aad[22], pn[6], pt[56];
+	int ctlen = (int)flen - 4 - 24 - 8 - 8;
+	u64 pn64;
+
+	if (re_pmf_ba < 2 || !wl_sae.tk_set || ctlen < 4 || ctlen > 48 || !(p[27] & 0x20) ||
+	    memcmp(p + 16, wl_sae.bssid, 6) != 0)
+		return 0;
+	pn[0] = p[24]; pn[1] = p[25]; pn[2] = p[28]; pn[3] = p[29]; pn[4] = p[30]; pn[5] = p[31];
+	wl_re_ccmp_blocks(p, pn, nonce, aad);
+	memcpy(pt, p + 32, ctlen + 8);
+	if (wl_re_ccm_fast(false, nonce, aad, pt, ctlen) != 0 || pt[0] != 3)
+		return 0;                       /* not decryptable here, or not Block Ack: SA-Query path */
+	pn64 = wl_re_ccmp_pn(p + 24);
+	if (pn64 <= wl_sae.rx_ba_pn) {
+		re_log("re ba: replayed protected BA frame pn=%llu <= %llu -> dropped\n",
+		       (unsigned long long)pn64, (unsigned long long)wl_sae.rx_ba_pn);
+		return -1;
+	}
+	wl_sae.rx_ba_pn = pn64;
+	if (re_verbose) {
+		u16 st = q >= 6 ? skb->data[4] | (skb->data[5] << 8) : 0;
+
+		re_log("re ba: AP %s token=%02x rxstatus1=0x%04x -> blob\n",
+		       pt[1] == 0 ? "ADDBA req" : pt[1] == 1 ? "ADDBA resp" : pt[1] == 2 ? "DELBA" : "BA action",
+		       pt[2], st);
+	}
+	memcpy(p + 24, pt, ctlen);
+	memmove(p + 24 + ctlen, p + flen - 4, 4);       /* keep the FCS bytes */
+	p[1] &= ~0x40;                                  /* no longer protected */
+	skb_trim(skb, q + 24 + ctlen + 4);
+	if (re_ba_rxclr && q >= 6) {
+		u16 st = skb->data[4] | (skb->data[5] << 8);
+
+		st &= ~(u16)re_ba_rxclr;
+		skb->data[4] = st & 0xff;
+		skb->data[5] = st >> 8;
+	}
+	return 1;
+}
+
+/* TX, atomic context, from the blob's wlc_sendmgmt(): protect the blob's own Block-Ack action
+ * frame (ADDBA req/resp, DELBA) to the AP in place, like the AP does under PMF. */
+static void wl_re_ba_tx(struct sk_buff *skb)
+{
+	u8 nonce[13], aad[22], pn[6], pt[24];
+	unsigned int q, lim, blen;
+	u64 txpn;
+	u8 *p;
+
+	if (!skb || !wl_sae.dev || skb->len < 24 + 6 || skb->len > 160)
+		return;
+	lim = skb->len - (24 + 6);
+	if (lim > 64)
+		lim = 64;
+	for (q = 0; q <= lim; q++) {
+		p = skb->data + q;
+		if (p[0] == 0xd0 && !(p[1] & 0x40) && p[24] == 3 &&
+		    memcmp(p + 4, wl_sae.bssid, 6) == 0 &&
+		    memcmp(p + 10, wl_sae.dev->dev_addr, 6) == 0 &&
+		    memcmp(p + 16, wl_sae.bssid, 6) == 0)
+			break;
+	}
+	if (q > lim)
+		return;
+	blen = skb->len - q - 24;
+	if (blen < 4 || blen > 16)
+		return;
+	if (skb_tailroom(skb) < 16 && pskb_expand_head(skb, 0, 16, GFP_ATOMIC)) {
+		re_log("re ba: no tailroom for the CCMP MIC, frame sent unprotected\n");
+		return;
+	}
+	p = skb->data + q;
+	txpn = (u64)atomic64_fetch_inc(&wl_sae.tx_pn);
+	pn[0] = txpn & 0xff; pn[1] = (txpn >> 8) & 0xff; pn[2] = (txpn >> 16) & 0xff;
+	pn[3] = (txpn >> 24) & 0xff; pn[4] = (txpn >> 32) & 0xff; pn[5] = (txpn >> 40) & 0xff;
+	wl_re_ccmp_blocks(p, pn, nonce, aad);
+	memcpy(pt, p + 24, blen);
+	if (wl_re_ccm_fast(true, nonce, aad, pt, blen) != 0) {
+		re_log("re ba: CCMP encrypt failed, frame sent unprotected\n");
+		return;
+	}
+	re_log("re ba: protecting the blob's BA action act=%u len=%u pn=%llu\n",
+	       p[25], blen, (unsigned long long)txpn);
+	p[1] |= 0x40;                                   /* Protected Frame */
+	p[24] = pn[0]; p[25] = pn[1]; p[26] = 0; p[27] = 0x20;   /* CCMP header, key id 0 */
+	p[28] = pn[2]; p[29] = pn[3]; p[30] = pn[4]; p[31] = pn[5];
+	memcpy(p + 32, pt, blen + 8);
+	skb_put(skb, 16);
+}
+
+extern int wlc_sendmgmt(void *wlc, void *pkt, void *txq, void *scb, long a5, long a6);
+int __wrap_wlc_sendmgmt(void *wlc, void *pkt, void *txq, void *scb, long a5, long a6)
+{
+	if (re_pmf_ba >= 2 && wl_sae.pmf_active && wl_sae.tk_set)
+		wl_re_ba_tx((struct sk_buff *)pkt);
+	return wlc_sendmgmt(wlc, pkt, txq, scb, a5, a6);
+}
+
 /* Deferred (process-context) handler: SW-decrypt the captured protected action frame; if it is
  * an SA-Query Request, build + SW-encrypt + TX a protected SA-Query Response. */
 extern int wl_re_mgmt_tx(struct net_device *dev, const unsigned char *f, int flen, void *scb);
 extern void *wl_re_find_scb(struct net_device *dev, const unsigned char *mac);
+static int wl_re_tx_prot_locked(struct net_device *dev, u8 fc0, const u8 *body, unsigned int blen);
 static void wl_re_saq_work(struct work_struct *w)
 {
 	u8 *f = wl_sae.saq_frame;
@@ -2680,10 +2873,18 @@ static void wl_re_saq_work(struct work_struct *w)
 			re_log("re: SA-Query response tid=%04x -> association is alive\n", tid);
 		}
 	}
+	if (re_pmf_ba >= 1 && ctlen >= 9 && body[0] == 3 && body[1] == 0) {   /* ADDBA Request we can't serve */
+		/* The blob cannot take part in a protected Block-Ack setup (or re_pmf_ba=1): decline it
+		 * properly instead of leaving the AP to re-send the request for ever. */
+		u8 resp[9] = { 3, 1, body[2], WLAN_STATUS_REQUEST_DECLINED & 0xff, 0, body[3], body[4], 0, 0 };
+		int rc = wl_re_tx_prot_locked(wl_sae.dev, 0xd0, resp, sizeof(resp));
+
+		re_log("re ba: declined the AP's ADDBA Request token=%02x -> %d\n", body[2], rc);
+	}
 	if (ctlen >= 4 && body[0] == 8 && body[1] == 0) {   /* SA-Query Request */
 		u8 rh[24], pt[12], resp[44];
 		u8 rnonce[13], raad[22], rpn[6];
-		u64 txpn = wl_sae.tx_pn++;
+		u64 txpn = (u64)atomic64_fetch_inc(&wl_sae.tx_pn);
 		int rc;
 		void *scb;
 		rh[0] = 0xd0; rh[1] = 0x40; rh[2] = 0; rh[3] = 0;   /* action + protected */
@@ -2714,9 +2915,10 @@ done:
 	wl_sae.saq_busy = false;
 }
 
-/* Build + TX a CCMP-protected robust management frame to the AP (process context only).
- * fc0 = frame control byte 0 (0xc0 deauth, 0xa0 disassoc, 0xd0 action); body <= 16 bytes. */
-static int wl_re_send_protected_mgmt(struct net_device *dev, u8 fc0, const u8 *body, unsigned int blen)
+/* Build + TX a CCMP-protected robust management frame to the AP (process context only; caller holds
+ * wl_saq_lock and has run wl_re_ccm_setup()). fc0 = frame control byte 0 (0xc0 deauth, 0xa0 disassoc,
+ * 0xd0 action); body <= 16 bytes. */
+static int wl_re_tx_prot_locked(struct net_device *dev, u8 fc0, const u8 *body, unsigned int blen)
 {
 	u8 rh[24], pt[16 + 8], frame[24 + 8 + 16 + 8];
 	u8 nonce[13], aad[22], pn[6];
@@ -2724,14 +2926,7 @@ static int wl_re_send_protected_mgmt(struct net_device *dev, u8 fc0, const u8 *b
 	void *scb;
 	int rc;
 
-	if (!wl_sae.tk_set || blen == 0 || blen > 16)
-		return -ENOENT;
-	mutex_lock(&wl_saq_lock);
-	rc = wl_re_ccm_setup();
-	if (rc)
-		goto out;
-
-	txpn = wl_sae.tx_pn++;
+	txpn = (u64)atomic64_fetch_inc(&wl_sae.tx_pn);
 	rh[0] = fc0; rh[1] = 0x40; rh[2] = 0; rh[3] = 0;    /* Protected Frame */
 	memcpy(rh + 4, wl_sae.bssid, 6);                    /* A1 = AP */
 	memcpy(rh + 10, dev->dev_addr, 6);                  /* A2 = us */
@@ -2743,14 +2938,25 @@ static int wl_re_send_protected_mgmt(struct net_device *dev, u8 fc0, const u8 *b
 	memcpy(pt, body, blen);
 	rc = wl_re_ccm(true, nonce, aad, 22, pt, blen);     /* -> blen bytes ciphertext + 8 bytes MIC */
 	if (rc)
-		goto out;
+		return rc;
 	memcpy(frame, rh, 24);
 	frame[24] = pn[0]; frame[25] = pn[1]; frame[26] = 0; frame[27] = 0x20;   /* CCMP hdr, key 0 */
 	frame[28] = pn[2]; frame[29] = pn[3]; frame[30] = pn[4]; frame[31] = pn[5];
 	memcpy(frame + 32, pt, blen + 8);
 	scb = wl_re_find_scb(dev, wl_sae.bssid);
-	rc = scb ? wl_re_mgmt_tx(dev, frame, 24 + 8 + blen + 8, scb) : -ENOENT;
-out:
+	return scb ? wl_re_mgmt_tx(dev, frame, 24 + 8 + blen + 8, scb) : -ENOENT;
+}
+
+static int wl_re_send_protected_mgmt(struct net_device *dev, u8 fc0, const u8 *body, unsigned int blen)
+{
+	int rc;
+
+	if (!wl_sae.tk_set || blen == 0 || blen > 16)
+		return -ENOENT;
+	mutex_lock(&wl_saq_lock);
+	rc = wl_re_ccm_setup();
+	if (!rc)
+		rc = wl_re_tx_prot_locked(dev, fc0, body, blen);
 	mutex_unlock(&wl_saq_lock);
 	return rc;
 }
@@ -2998,6 +3204,21 @@ void __wrap_wlc_recv(void *wlc, void *pkt)
 			if (fc0 == 0xd0 && (fc1 & 0x40) &&                        /* action, protected */
 			    memcmp(skb->data + q + 10, ap, 6) == 0 &&             /* SA = AP */
 			    memcmp(skb->data + q + 4, me, 6) == 0 &&              /* DA = us */
+			    wl_sae.tk_set && re_pmf_ba >= 2) {
+				/* Block Ack (ADDBA/DELBA): decrypt here and let the blob process it as if it had
+				 * arrived unprotected, so a Block-Ack agreement (frame aggregation) can be set up. */
+				int ba = wl_re_ba_rx(skb, q);
+
+				if (ba > 0)
+					goto pass;
+				if (ba < 0) {
+					wl_re_pktfree(wl_sae.dev, pkt);
+					return;
+				}
+			}
+			if (fc0 == 0xd0 && (fc1 & 0x40) &&                        /* action, protected */
+			    memcmp(skb->data + q + 10, ap, 6) == 0 &&             /* SA = AP */
+			    memcmp(skb->data + q + 4, me, 6) == 0 &&              /* DA = us */
 			    wl_sae.tk_set && !wl_sae.saq_busy) {
 				unsigned int fl = skb->len - q;
 				if (fl <= sizeof(wl_sae.saq_frame)) {
@@ -3012,6 +3233,7 @@ void __wrap_wlc_recv(void *wlc, void *pkt)
 			}
 		}
 	}
+pass:
 	wlc_recv(wlc, pkt);
 }
 /* =================== end M3 bridge =================== */
@@ -4116,6 +4338,7 @@ void wl_cfg80211_detach(struct net_device *ndev)
 		cancel_work_sync(&wl_sae.saq_work);
 		cancel_work_sync(&wl_sae.dd_work);
 	}
+	wl_re_crypto_exit();
 	wl_deinit_cfg80211_priv(wl);
 	wl_free_wdev(wl);
 }
