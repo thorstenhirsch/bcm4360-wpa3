@@ -132,9 +132,33 @@ manual rebuild instead, run `./build.sh` → `wl-src/wl.ko`.
 The driver is quiet by default. For a bug report, or to watch the WPA3/PMF state machine, enable
 verbose logging (BSSIDs and the RSN IE are logged, so scrub them before posting):
 ```sh
-echo 1 | sudo tee /sys/module/wl/parameters/re_verbose          # this boot
+echo 1 | sudo tee /sys/module/wl/parameters/re_verbose          # this boot: state machine, EAPOL, firmware events
+echo 2 | sudo tee /sys/module/wl/parameters/re_verbose          # + the blob's TX/RX counters every 5 s
 echo 'options wl re_verbose=1' | sudo tee /etc/modprobe.d/wl-debug.conf   # permanent
 ```
+
+### Replacing Ubuntu/Debian's stock `wl` (broadcom-sta-dkms) permanently
+Both packages provide a module named `wl`, so the stock one has to go. In the repo directory:
+```sh
+# 1. keep the pristine blob (the stock package's copy is the right one; same sha256 as above)
+mkdir -p wl-src/lib
+cp /usr/src/broadcom-sta-*/lib/wlc_hybrid.o_amd64 wl-src/lib/wlc_hybrid.o_amd64.orig
+# 2. remove the stock driver (otherwise it is rebuilt for every new kernel and fights over the name `wl`)
+sudo apt purge broadcom-sta-dkms        # (broadcom-sta-common is pulled out with it)
+# 3. install ours via DKMS: rebuilt automatically for every new kernel, loaded at boot before NetworkManager
+sudo dkms/install.sh
+# 4. check
+dkms status                             # wl-wpa3/<version>, installed
+modinfo wl | grep -E "filename|description"    # .../updates/dkms/wl.ko*, "...WPA3-SAE and 802.11w (PMF) support"
+systemctl status wl-wpa3.service
+```
+Then set your network profile to WPA3 (see below), reboot once and check `nmcli dev` shows the wifi
+device. With Secure Boot enabled the module must be signed (DKMS signs it with your enrolled MOK on
+Ubuntu); with it disabled nothing is needed.
+
+To go back: `sudo dkms remove wl-wpa3/<version> --all`, `sudo systemctl disable --now wl-wpa3`,
+remove `/etc/modprobe.d/wl-wpa3.conf` and `/etc/systemd/system/wl-wpa3.service`, and
+`sudo apt install broadcom-sta-dkms`.
 
 ## WPA2/WPA3 transition-mode APs
 
@@ -142,30 +166,44 @@ Use a **WPA3 (SAE)** profile on the client; a `wpa-psk` profile connects with WP
 ```sh
 nmcli con modify YOUR_CON wifi-sec.key-mgmt sae 802-11-wireless-security.pmf 3
 ```
-For SAE connections the driver then:
-- detects SAE from the auth type, every offered AKM and wpa_supplicant's RSN IE;
-- keeps the blob from roaming on its own, and **refuses any association the blob makes without a
-  successful host SAE** (the blob can only do Open/PSK, which a transition-mode AP would accept);
-- fails the connect right away when SAE fails, when the AP rejects the association, or when the
-  association has not completed 3 s after SAE (so wpa_supplicant retries immediately instead of
-  after its 10 s timeout);
-- sends a CCMP-protected deauth on disconnect (the blob's own deauth is unprotected and a PMF
-  AP ignores it).
+On a FRITZ!Box 6690 in WPA2/WPA3 mixed mode this is stable: 45 min soaks with an AP group-key rekey every
+10 min, 16 back-to-back disconnect/reconnect cycles, suspend/resume.
+
+What had to be fixed to get there (details in the commit messages):
+- **The association request was malformed.** SAE connects carry `wpa_versions = WPA3`, which the glue did not
+  know, so the blob ran with WPA off and added a bogus legacy-WPA IE; we also pasted wpa_supplicant's whole IE
+  buffer next to the blob's own, duplicating Extended Capabilities. The AP accepted such a station but then
+  failed every group-key rekey, deauthenticated it, and the link sat "up" but dead. Now only the RSN/RSNX
+  elements are injected and `wpa_auth` is right from the start.
+- **The AP dropping us used to be invisible.** Its management frames are CCMP-protected (the blob can't
+  decrypt them) and unprotected deauths are filtered. Now a protected deauth/disassoc is verified in software
+  and honoured, an unprotected "class 2/3" deauth triggers a software SA Query (no answer -> reconnect), and
+  the association is probed after resume.
+- **Two races/bugs in the glue:** the host SAE exchange could start before the blob's own stub auth frame
+  (which made the AP drop the join; it now follows the stub), and the cfg80211 BSS lookup used pre-4.1
+  arguments so a connect could be silently discarded when the scan entry had expired.
+- **Bounded reconnect time.** A failed join (the AP answers "try again later", or not at all, when the BSS
+  we just left is re-joined) is retried silently up to 3 times; an association with no 4-way handshake is
+  dropped after 3.5 s instead of 10 s; the protected deauth sent on disconnect is retransmitted if the
+  firmware reports it un-ACKed; there are at least 2 s between a disconnect and the next join.
 
 If the AP uses the same SSID on 2.4 and 5 GHz, wpa_supplicant picks the stronger BSS; pin one with
 `802-11-wireless.band a|bg` or `802-11-wireless.bssid` if you want.
 
-**Known issue:** re-joining a transition-mode AP *immediately* after disconnecting from it (e.g.
-`nmcli con down` followed at once by `nmcli con up`) can fail on the first try and succeed on the
-next, because the AP appears to still hold the old association. Typical connect time in that
-stress test is 1-7 s, with an occasional ~20 s case. It was not observed on the first connect
-after loading the module. (Suspend/resume has not been tested.)
+**Known issues**
+- Re-joining the BSS you just left is the AP's weak spot (FRITZ!Box: "try again later" / no answer in
+  30-40% of back-to-back reconnects). The driver absorbs it; the cost is an occasional ~5 s reconnect instead
+  of ~1-2 s. WPA2-PSK median 1.7 s, max 5.4 s; SAE 0.3-1.1 s in 16-cycle stress tests.
+- In PMF sessions 10-30% of transmitted frames are retried (about 0% with WPA2-PSK); throughput was not
+  measured. The AP's protected Block-Ack setup requests (ADDBA) are swallowed unanswered (the blob cannot
+  decrypt them), so frame aggregation is probably not in use with a PMF AP.
+- Not tested: a WPA3-only AP on this version, other APs than the FRITZ!Box 6690, 6.12-7.2 beyond building.
 
 ## Tested
 
 | Kernel | How | Result |
 |---|---|---|
-| 7.3.0-9 (Ubuntu 26.10) | loaded and used, Intel MacBookPro11,1, FRITZ!Box 6690 in WPA2/WPA3 mixed mode (2.4 + 5 GHz, same SSID) | all ~40 down/up reconnect cycles ended connected over SAE (some needed a retry, see known issue); WPA2-PSK and SAE profiles can be switched without reloading; clean `rmmod`/`insmod`; wrong password fails cleanly |
+| 7.3.0-9 (Ubuntu 26.10) | loaded and used, Intel MacBookPro11,1 (BCM4360), FRITZ!Box 6690 in WPA2/WPA3 mixed mode (2.4 + 5 GHz, same SSID) | 45 min SAE soak: 529 pings, 0 outages, 6 AP rekeys accepted; 16 + 16 back-to-back reconnects (SAE / WPA2) all connected, none over 5.4 s; WPA2-PSK and SAE profiles switch without reloading; clean `rmmod`/`insmod`; wrong password fails cleanly; suspend/resume reconnects by itself; no kernel warnings |
 | 6.12, 6.14, 6.17, 7.0, 7.1, 7.2 | build only, against the mainline-PPA header packages | builds |
 | 6.12 (Debian 13) | loaded and used, MacBookPro11,3, WPA3-only AP (previous release) | worked |
 
