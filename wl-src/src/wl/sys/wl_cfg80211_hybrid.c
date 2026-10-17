@@ -1152,6 +1152,7 @@ static struct {
 	atomic_t txfail_cnt;           /* WLC_E_TXFAIL events seen (a frame the AP never ACKed) */
 	u32  assoc_status;             /* 802.11 status code of the last association response (WLC_E_ASSOC) */
 	struct delayed_work retry_work; /* retry a join the AP answered with status 30 */
+	struct delayed_work join_work; /* issue a join deferred by the rejoin quiet time */
 	struct delayed_work hs_wd;     /* 4-way handshake watchdog */
 	u8   join_buf[128];            /* the WLC_SET_SSID request of the current connect, for retries */
 	size_t join_len;
@@ -1202,6 +1203,49 @@ static void wl_re_saq_chk_work(struct work_struct *w);
  * Reporting the failure sends wpa_supplicant on a ~3.5 s scan, a hop to the other band and, in 2 of 5
  * cases, a 10 s wait for a 4-way handshake that never starts. Wait a moment and join the same BSS
  * again, silently (bounded: WL_SAE_MAX_RETRIES times, then the failure is reported as before). */
+
+/* Send the saved WLC_SET_SSID request (wl_sae.join_buf). For SAE this also arms the host exchange,
+ * which is started once the blob's stub auth frame is out (or after a fallback delay). */
+static int wl_sae_issue_join(struct net_device *dev)
+{
+	struct wl_cfg80211_priv *wl = ndev_to_wl(dev);
+	int err;
+
+	if (wl_sae.sae_conn) {   /* SAE: a fresh host-driven exchange; other joins are fully blob-driven */
+		wl_sae.stub_seen = false;
+		wl_sae.armed = 1;
+		schedule_delayed_work(&wl_sae.work, msecs_to_jiffies(WL_SAE_START_FALLBACK_MS));
+	}
+	err = wl_dev_ioctl(dev, WLC_SET_SSID, wl_sae.join_buf, wl_sae.join_len);
+	if (err) {
+		if (wl_sae.sae_conn) {
+			wl_sae.armed = 0;
+			cancel_delayed_work(&wl_sae.work);
+		}
+		return err;
+	}
+	set_bit(WL_STATUS_CONNECTING, &wl->status);
+	re_log("re: CONNECTING set\n");
+	return 0;
+}
+
+/* .connect must not sleep (it runs under the wiphy mutex / RTNL, which would stall every other
+ * wireless operation), so a join that has to wait out the rejoin quiet time is issued from here. */
+static void wl_sae_join_work(struct work_struct *w)
+{
+	struct net_device *dev = wl_sae.dev;
+	int err;
+
+	if (!dev || !wl_sae.join_len)
+		return;
+	err = wl_sae_issue_join(dev);
+	if (err) {
+		WL_ERR(("deferred join failed (%d)\n", err));
+		cfg80211_connect_result(dev, wl_sae.bssid, NULL, 0, NULL, 0,
+		                        WLAN_STATUS_AUTH_TIMEOUT, GFP_KERNEL);
+	}
+}
+
 static void wl_sae_retry_work(struct work_struct *w)
 {
 	struct net_device *dev = wl_sae.dev;
@@ -1216,14 +1260,11 @@ static void wl_sae_retry_work(struct work_struct *w)
 	wl_sae.retries++;
 	wl_sae.assoc_status = 0;
 	re_log("re: retrying the join (#%d) after the AP's 'try again later'\n", wl_sae.retries);
-	if (wl_sae.sae_conn) {   /* SAE: a fresh host-driven exchange; other joins are fully blob-driven */
+	if (wl_sae.sae_conn) {
 		wl_sae.sae_ok = false;
-		wl_sae.stub_seen = false;
 		wl_re_release_assoc_ie();
-		wl_sae.armed = 1;
-		schedule_delayed_work(&wl_sae.work, msecs_to_jiffies(WL_SAE_START_FALLBACK_MS));
 	}
-	err = wl_dev_ioctl(dev, WLC_SET_SSID, wl_sae.join_buf, wl_sae.join_len);
+	err = wl_sae_issue_join(dev);
 	if (err) {
 		re_log("re: join retry failed (%d) -> reporting the failure\n", err);
 		if (test_and_clear_bit(WL_STATUS_CONNECTING, &wl->status))
@@ -1335,6 +1376,7 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 		INIT_WORK(&wl_sae.dd_work, wl_re_dd_work);
 		INIT_DELAYED_WORK(&wl_sae.saq_chk, wl_re_saq_chk_work);
 		INIT_DELAYED_WORK(&wl_sae.retry_work, wl_sae_retry_work);
+		INIT_DELAYED_WORK(&wl_sae.join_work, wl_sae_join_work);
 		INIT_DELAYED_WORK(&wl_sae.hs_wd, wl_sae_hs_wd_work);
 		atomic_set(&wl_sae.txfail_cnt, 0);
 		wl_sae.tx_pn = 0x1000000;   /* start well above any short-session data PN */
@@ -1343,17 +1385,11 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 	wl_sae.dev = dev;
 	cancel_delayed_work_sync(&wl_sae.work);       /* a start scheduled by a previous attempt */
 	cancel_delayed_work_sync(&wl_sae.retry_work);
+	cancel_delayed_work_sync(&wl_sae.join_work);
 	cancel_delayed_work_sync(&wl_sae.hs_wd);
 	wl_sae.assoc_status = 0;
 	wl_sae.retries = 0;
 	wl_sae.ptk_done = false;
-	/* quiet time after the last disconnect: the AP needs a moment to finish with the old association */
-	if (wl_sae.last_disc && time_before(jiffies, wl_sae.last_disc + msecs_to_jiffies(WL_MIN_REJOIN_GAP_MS))) {
-		unsigned int ms = jiffies_to_msecs(wl_sae.last_disc + msecs_to_jiffies(WL_MIN_REJOIN_GAP_MS) - jiffies);
-
-		re_log("re: waiting %u ms after the last disconnect before joining\n", ms);
-		msleep(ms);
-	}
 	cancel_delayed_work_sync(&wl_sae.assoc_wd);   /* stale watchdog of a previous attempt */
 	cancel_delayed_work_sync(&wl_sae.saq_chk);
 	wl_sae.saq_pending = false;
@@ -1438,19 +1474,9 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 	} else {
 		wl_sae.join_len = 0;
 	}
-	err = wl_dev_ioctl(dev, WLC_SET_SSID, &join_params, join_params_size);
-	if (err) {
-		WL_ERR(("error (%d)\n", err));
-		return err;
-	}
-
-	set_bit(WL_STATUS_CONNECTING, &wl->status);
-	re_log("re: CONNECTING set\n");
-
-	/* M3: for WPA3-SAE, ask userspace (wpa_supplicant) to run the SAE auth
-	 * exchange; it will build commit/confirm frames and TX them via .mgmt_tx. */
+	/* M3: for WPA3-SAE the exchange is run by userspace (wpa_supplicant) via .external_auth and
+	 * .mgmt_tx; it is armed and scheduled in wl_sae_issue_join(). */
 	if (wl_sae.sae_conn) {
-		wl_sae.dev = dev;
 		/* NetworkManager connects by SSID with NO fixed BSSID; the firmware picks the AP
 		 * and we capture its MAC from __wrap_wlc_sendauth (arg2). Only seed from sme->bssid
 		 * if it was given (e.g. a standalone wpa_supplicant config with bssid=). */
@@ -1460,13 +1486,39 @@ wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 			memset(wl_sae.bssid, 0, ETH_ALEN);
 		wl_sae.ssid.ssid_len = min_t(size_t, sme->ssid_len, sizeof(wl_sae.ssid.ssid));
 		memcpy(wl_sae.ssid.ssid, sme->ssid, wl_sae.ssid.ssid_len);
-		wl_sae.armed = 1;       /* arm the SAE hooks for this exchange */
-		re_log("re: scheduling external SAE auth (bssid %pM)\n", wl_sae.bssid);
-		wl_sae.stub_seen = false;
-		/* normally brought forward by __wrap_wlc_sendauth() as soon as the blob's stub is out */
-		schedule_delayed_work(&wl_sae.work, msecs_to_jiffies(WL_SAE_START_FALLBACK_MS));
 	}
 
+	/* Quiet time after the last disconnect: the AP needs a moment to finish with the old
+	 * association. Wait for it from a delayed work rather than sleeping here (see wl_sae_join_work). */
+	if (wl_sae.join_len && wl_sae.last_disc &&
+	    time_before(jiffies, wl_sae.last_disc + msecs_to_jiffies(WL_MIN_REJOIN_GAP_MS))) {
+		unsigned long delay = wl_sae.last_disc + msecs_to_jiffies(WL_MIN_REJOIN_GAP_MS) - jiffies;
+
+		re_log("re: deferring the join by %u ms (quiet time after the last disconnect)\n",
+		       jiffies_to_msecs(delay));
+		schedule_delayed_work(&wl_sae.join_work, delay);
+		return 0;
+	}
+
+	if (!wl_sae.join_len) {   /* request too large for the retry buffer: send it directly */
+		err = wl_dev_ioctl(dev, WLC_SET_SSID, &join_params, join_params_size);
+		if (err) {
+			WL_ERR(("error (%d)\n", err));
+			return err;
+		}
+		set_bit(WL_STATUS_CONNECTING, &wl->status);
+		re_log("re: CONNECTING set\n");
+		if (wl_sae.sae_conn) {
+			wl_sae.stub_seen = false;
+			wl_sae.armed = 1;
+			schedule_delayed_work(&wl_sae.work, msecs_to_jiffies(WL_SAE_START_FALLBACK_MS));
+		}
+		return 0;
+	}
+
+	err = wl_sae_issue_join(dev);
+	if (err)
+		WL_ERR(("error (%d)\n", err));
 	return err;
 }
 
@@ -1485,6 +1537,7 @@ wl_cfg80211_disconnect(struct wiphy *wiphy, struct net_device *dev, u16 reason_c
 		cancel_delayed_work_sync(&wl_sae.assoc_wd);
 		cancel_delayed_work_sync(&wl_sae.saq_chk);
 		cancel_delayed_work_sync(&wl_sae.retry_work);
+		cancel_delayed_work_sync(&wl_sae.join_work);
 		cancel_delayed_work_sync(&wl_sae.hs_wd);
 	}
 	wl_sae.saq_pending = false;
@@ -4063,6 +4116,7 @@ void wl_cfg80211_detach(struct net_device *ndev)
 		cancel_delayed_work_sync(&wl_sae.assoc_wd);
 		cancel_delayed_work_sync(&wl_sae.saq_chk);
 		cancel_delayed_work_sync(&wl_sae.retry_work);
+		cancel_delayed_work_sync(&wl_sae.join_work);
 		cancel_delayed_work_sync(&wl_sae.hs_wd);
 		cancel_work_sync(&wl_sae.saq_work);
 		cancel_work_sync(&wl_sae.dd_work);
