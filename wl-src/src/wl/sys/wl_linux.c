@@ -154,6 +154,26 @@ module_param(re_verbose, int, 0644);
 MODULE_PARM_DESC(re_verbose, "verbose WPA3/PMF debug printk (1=on, 0=off, default off)");
 #define re_log(...) do { if (re_verbose) printk(KERN_ERR __VA_ARGS__); } while (0)
 
+/* Verbose-only EAPOL-Key trace. `eth` points at the Ethernet header. Layout after it: EAPOL
+ * ver, type(3=Key), len(2), descriptor type, Key Information(2), key length(2), replay counter(8). */
+static void re_trace_eapol(wl_info_t *wl, const char *dir, const unsigned char *eth, unsigned int len)
+{
+	wl_cnt_t *c;
+
+	if (!re_verbose || len < 14 + 17 || eth[12] != 0x88 || eth[13] != 0x8e || eth[15] != 3)
+		return;
+	printk(KERN_ERR "re: %s EAPOL-Key keyinfo=0x%04x replay=%02x%02x%02x%02x%02x%02x%02x%02x len=%u\n",
+	       dir, (eth[19] << 8) | eth[20], eth[23], eth[24], eth[25], eth[26], eth[27], eth[28],
+	       eth[29], eth[30], len);
+	/* the blob's own counters: did the AP ACK our frame, can we decrypt what we receive? */
+	if (wl && wl->pub && (c = wl->pub->_cnt))
+		printk(KERN_ERR "re: cnt txfail=%u txretry=%u txnoack=%u txnocts=%u rxundec=%u/%u "
+		       "ccmpundec=%u/%u ccmpreplay=%u/%u ccmpfmterr=%u/%u rxcrc=%u\n",
+		       c->txfail, c->txretry, c->txnoack, c->txnocts, c->rxundec, c->rxundec_mcst,
+		       c->ccmpundec, c->ccmpundec_mcst, c->ccmpreplay, c->ccmpreplay_mcst,
+		       c->ccmpfmterr, c->ccmpfmterr_mcst, c->rxcrc);
+}
+
 void *wl_re_dev_wlc(struct net_device *dev, void **osh_out)
 {
 	wl_info_t *wl = WL_INFO(dev);
@@ -2250,6 +2270,7 @@ wl_sendup(wl_info_t *wl, wl_if_t *wlif, void *p, int numpkt)
 
 	}
 
+	re_trace_eapol(wl, "rx", skb->data, skb->len);
 	skb->protocol = eth_type_trans(skb, skb->dev);
 
 	if (!brcm_specialpkt && !ISALIGNED(skb->data, 4)) {
@@ -2392,6 +2413,7 @@ wl_start(struct sk_buff *skb, struct net_device *dev)
 	wlif = WL_DEV_IF(dev);
 	wl = WL_INFO(dev);
 
+	re_trace_eapol(wl, "tx", skb->data, skb->len);
 	skb->prev = NULL;
 	if (WL_ALL_PASSIVE_ENAB(wl) || (WL_RTR() && WL_CONFIG_SMP())) {
 
@@ -3422,6 +3444,8 @@ wl_report_radio_state(wl_info_t *wl)
 
 #endif 
 
+static unsigned int re_tick;   /* watchdog ticks (1/s) for the re_verbose>=2 stats line */
+
 static int
 wl_linux_watchdog(void *ctx)
 {
@@ -3463,6 +3487,19 @@ wl_linux_watchdog(void *ctx)
 					stats->rx_fifo_errors = WLCNTVAL(wl->pub->_cnt->rxoflo);
 					stats->rx_missed_errors = 0;
 					stats->tx_fifo_errors = 0;
+
+					/* re_verbose >= 2: counter time series (every 5 s) to see when TX/RX
+					 * health changes, e.g. around a group-key rekey */
+					if (re_verbose >= 2 && wl->pub->_cnt && (++re_tick % 5) == 0) {
+						wl_cnt_t *c = wl->pub->_cnt;
+						int pm = -1;
+						wlc_get(wl->wlc, WLC_GET_PM, &pm);
+						printk(KERN_ERR "re: stat pm=%d tx=%lu rx=%lu txfail=%u retry=%u noack=%u "
+						       "rxundec=%u/%u ccmpundec=%u/%u replay=%u/%u rxcrc=%u\n", pm,
+						       stats->tx_packets, stats->rx_packets, c->txfail, c->txretry,
+						       c->txnoack, c->rxundec, c->rxundec_mcst, c->ccmpundec,
+						       c->ccmpundec_mcst, c->ccmpreplay, c->ccmpreplay_mcst, c->rxcrc);
+					}
 				}
 
 #ifdef USE_IW
