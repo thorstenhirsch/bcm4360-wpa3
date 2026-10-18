@@ -2716,7 +2716,7 @@ module_param(re_pmf_ba, int, 0644);
 MODULE_PARM_DESC(re_pmf_ba, "802.11w Block Ack: 0=off, 1=decline the AP's ADDBA, 2=full (default)");
 int re_pmf_stall = 1;
 module_param(re_pmf_stall, int, 0644);
-MODULE_PARM_DESC(re_pmf_stall, "probe the AP and reconnect when a PMF link retries most of its frames for 12 s (1=on, 0=off, 2=test: treat every window as bad)");
+MODULE_PARM_DESC(re_pmf_stall, "PMF link with most frames retried for 12 s: 0=off, 1=probe the AP only (default), 2=also drop the link after 3 such windows, 3=test mode (every window counts as bad, drops)");
 unsigned int re_ba_rxclr;
 module_param(re_ba_rxclr, uint, 0644);
 MODULE_PARM_DESC(re_ba_rxclr, "debug: RxStatus1 bits to clear on re-injected Block-Ack frames");
@@ -3103,7 +3103,7 @@ void wl_re_link_tick(struct net_device *dev, unsigned long tx, unsigned long ret
 	ticks = 0;
 	dtx = tx - w_tx;
 	dretry = retry - w_retry;
-	if (re_pmf_stall == 2)                 /* test mode: pretend every window is bad */
+	if (re_pmf_stall == 3)                 /* test mode: pretend every window is bad */
 		dretry = WL_STALL_MIN_RETRY + 2 * dtx;
 	else if (time_before(jiffies, scan_seen + (WL_STALL_WINDOW_S + 3) * HZ)) {
 		bad = 0;                       /* a scan always costs a burst of retries */
@@ -3118,10 +3118,10 @@ void wl_re_link_tick(struct net_device *dev, unsigned long tx, unsigned long ret
 	       dretry, dtx, WL_STALL_WINDOW_S, bad);
 	if (wl_sae.dd_busy || wl_sae.saq_pending)
 		return;
-	if (bad >= WL_STALL_FORCE_WINDOWS) {
+	if (bad >= WL_STALL_FORCE_WINDOWS && re_pmf_stall >= 2) {
 		bad = 0;
 		wl_sae.dd_kind = 2;            /* drop the link */
-	} else if (time_after(jiffies, last_probe + WL_STALL_PROBE_GAP_S * HZ)) {
+	} else if (bad < WL_STALL_FORCE_WINDOWS && time_after(jiffies, last_probe + WL_STALL_PROBE_GAP_S * HZ)) {
 		last_probe = jiffies;
 		wl_sae.dd_kind = 1;            /* SA Query */
 	} else {

@@ -153,8 +153,9 @@ while the stack kept showing "connected" until the connection was restarted by h
 the retry counters in 12 s windows (windows containing a scan are ignored, scans always cost a burst of
 retries). A window with retries >= 70% of the frames sent triggers an SA Query probe; no answer drops the
 link, and if the AP answers but the link stays that bad for 3 windows (about 36 s) the link is dropped
-anyway, so wpa_supplicant reconnects (a few seconds). Module parameter `re_pmf_stall`: `1` (default) = on,
-`0` = off, `2` = test mode (every window counts as bad, for exercising the recovery). The cause of the rate
+anyway (opt-in, `re_pmf_stall=2`), so wpa_supplicant reconnects (a few seconds). Module parameter `re_pmf_stall`: `1` (default) =
+probe only, `0` = off, `2` = probe and drop, `3` = test mode (every window counts as bad). The drop is not the default
+because an idle 2.4 GHz link showed false alarms overnight (about one retry per frame, SA Query answered). The cause of the rate
 runaway itself is not understood (it was seen 4 times in about 60 scans with the Block-Ack handling above, and
 never in about 150 scans without it).
 
